@@ -8,7 +8,7 @@ services:
       dockerfile: ./docker/sui-node/Dockerfile
       args:
         # update with git sha of whichever branch you're building on.
-        GIT_REVISION: db24658bc9
+        GIT_REVISION: de632da6a
         BUILD_DATE: today
 
     environment:
@@ -22,9 +22,14 @@ services:
     # populate your local ./fullnode/config/ directory with fullnode.yaml and genesis.blob for the network you want to use.
     volumes:
       - ./fullnode:/opt/sui
+      - ./fullnode/config/fullnode.yaml:/opt/sui/config/fullnode.yaml:ro
+      - ./fullnode/config/genesis.blob:/opt/sui/config/genesis.blob:ro
+      - ./fullnode/suidb:/opt/sui/db:rw
     ports:
       - 9000
-      - 9184
+      - target: 9184
+        published: 9184
+        protocol: tcp
       - target: 8084
         published: 8084
         protocol: udp
@@ -39,14 +44,16 @@ services:
     volumes:
       - ./indexer:/opt/sui
     environment:
-      - RUST_LOG="info"
+      - RUST_LOG="debug"
       - RUST_JSON_LOG="true"
-      - DATABASE_URL=postgres://postgres:admin@postgres:5432/sui_indexer_testnet
+      - DATABASE_URL=postgres://postgres:test456PassSuI@postgres:5432/sui_indexer_testnet
       - RPC_CLIENT_URL=http://fullnode:9000
     ports:
       - target: 9000
         published: 9000
         protocol: tcp
+      - 9184
+    expose:
       - 9184
     depends_on:
       - postgres
@@ -56,9 +63,34 @@ services:
     image: postgres:15
     restart: unless-stopped
     environment:
-      - POSTGRES_PASSWORD=admin
+      - POSTGRES_PASSWORD=test456PassSuI
     ports:
       - target: 5432
         published: 5432
     volumes:
       - ./postgres/data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=1000"
+      - "-c"
+      - "shared_buffers=16GB"
+      - "-c"
+      - "effective_cache_size=48GB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "maintenance_work_mem=2GB"
+      - "-c"
+      - "checkpoint_segments=32"
+      - "-c"
+      - "checkpoint_completion_target=0.7"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "max_wal_size=16GB"
+      - "-c"
+      - "default_statistics_target=100"
+
+volumes:
+  suidb:
