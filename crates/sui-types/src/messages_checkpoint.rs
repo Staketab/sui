@@ -7,6 +7,7 @@ use crate::committee::{EpochId, ProtocolVersion, StakeUnit};
 use crate::crypto::{
     default_hash, AggregateAuthoritySignature, AuthoritySignInfo, AuthorityStrongQuorumSignInfo,
 };
+use crate::digests::Digest;
 use crate::error::SuiResult;
 use crate::gas::GasCostSummary;
 use crate::message_envelope::{Envelope, Message, TrustedEnvelope, VerifiedEnvelope};
@@ -15,9 +16,10 @@ use crate::signature::GenericSignature;
 use crate::storage::ReadStore;
 use crate::sui_serde::AsProtocolVersion;
 use crate::sui_serde::BigInt;
+use crate::sui_serde::Readable;
 use crate::{base_types::AuthorityName, committee::Committee, error::SuiError};
 use anyhow::Result;
-use fastcrypto::hash::{Digest, MultisetHash};
+use fastcrypto::hash::MultisetHash;
 use once_cell::sync::OnceCell;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -56,20 +58,20 @@ pub struct CheckpointResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ECMHLiveObjectSetDigest {
     #[schemars(with = "[u8; 32]")]
-    pub digest: Digest<32>,
+    pub digest: Digest,
 }
 
-impl From<Digest<32>> for ECMHLiveObjectSetDigest {
-    fn from(digest: Digest<32>) -> Self {
-        Self { digest }
+impl From<fastcrypto::hash::Digest<32>> for ECMHLiveObjectSetDigest {
+    fn from(digest: fastcrypto::hash::Digest<32>) -> Self {
+        Self {
+            digest: Digest::new(digest.digest),
+        }
     }
 }
 
 impl Default for ECMHLiveObjectSetDigest {
     fn default() -> Self {
-        Self {
-            digest: Accumulator::default().digest(),
-        }
+        Accumulator::default().digest().into()
     }
 }
 
@@ -97,13 +99,13 @@ pub struct EndOfEpochData {
     /// The committee is stored as a vector of validator pub key and stake pairs. The vector
     /// should be sorted based on the Committee data structure.
     #[schemars(with = "Vec<(AuthorityName, BigInt<u64>)>")]
-    #[serde_as(as = "Vec<(_, BigInt<u64>)>")]
+    #[serde_as(as = "Vec<(_, Readable<BigInt<u64>, _>)>")]
     pub next_epoch_committee: Vec<(AuthorityName, StakeUnit)>,
 
     /// The protocol version that is in effect during the epoch that starts immediately after this
     /// checkpoint.
     #[schemars(with = "AsProtocolVersion")]
-    #[serde_as(as = "AsProtocolVersion")]
+    #[serde_as(as = "Readable<AsProtocolVersion, _>")]
     pub next_epoch_protocol_version: ProtocolVersion,
 
     /// Commitments to epoch specific state (e.g. live object set)
