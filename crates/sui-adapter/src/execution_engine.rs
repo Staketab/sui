@@ -260,8 +260,8 @@ fn execute_transaction<
 
             // This limit is only present in Version 3 and up, so use this to gate it
             if let (Some(normal_lim), Some(system_lim)) =
-                (protocol_config.max_size_written_objects(), protocol_config
-            .max_size_written_objects_system_tx()) {
+                (protocol_config.max_size_written_objects_as_option(), protocol_config
+            .max_size_written_objects_system_tx_as_option()) {
                 let written_objects_size = temporary_store.written_objects_size();
 
                 match check_limit_by_meter!(
@@ -337,6 +337,7 @@ fn execute_transaction<
                   // conservation violated. try to avoid panic by dumping all writes, charging for gas, re-checking
                   // conservation, and surfacing an aborted transaction with an invariant violation if all of that works
                   result = Err(conservation_err);
+                  temporary_store.reset(gas, &mut gas_status);
                   temporary_store.charge_gas(gas_object_id, &mut gas_status, &mut result, gas);
                   // check conservation once more more. if we still fail, it's a problem with gas
                   // charging that happens even in the "aborted" case--no other option but panic.
