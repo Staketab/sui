@@ -45,6 +45,7 @@ use sui_types::messages_checkpoint::{
 use sui_types::object::ObjectRead;
 
 use crate::errors::{Context, IndexerError};
+use crate::metrics::IndexerMetrics;
 use crate::models::addresses::Address;
 use crate::models::checkpoints::Checkpoint;
 use crate::models::epoch::DBEpochInfo;
@@ -103,10 +104,15 @@ pub struct PgIndexerStore {
     #[allow(dead_code)]
     partition_manager: PartitionManager,
     module_cache: Arc<SyncModuleCache<IndexerModuleResolver>>,
+    metrics: IndexerMetrics,
 }
 
 impl PgIndexerStore {
-    pub async fn new(cp: AsyncPgConnectionPool, blocking_cp: PgConnectionPool) -> Self {
+    pub async fn new(
+        cp: AsyncPgConnectionPool,
+        blocking_cp: PgConnectionPool,
+        metrics: IndexerMetrics,
+    ) -> Self {
         let module_cache = Arc::new(SyncModuleCache::new(IndexerModuleResolver::new(
             blocking_cp.clone(),
         )));
@@ -114,6 +120,7 @@ impl PgIndexerStore {
             cp: cp.clone(),
             partition_manager: PartitionManager::new(blocking_cp).await.unwrap(),
             module_cache,
+            metrics,
         }
     }
 
@@ -1483,9 +1490,14 @@ WHERE e1.epoch = e2.epoch
         // } else {
         //     self.get_current_epoch().await?.first_checkpoint_id as i64
         // };
-        // self.partition_manager
-        //     .advance_epoch(&data.new_epoch, last_epoch_cp_id)
-        //     .await?;
+        if data.last_epoch.is_none() {
+            let last_epoch_cp_id = 0;
+            self.partition_manager
+                .advance_epoch(&data.new_epoch, last_epoch_cp_id)
+                .await?;
+        }
+        let epoch = data.new_epoch.epoch;
+        info!("Persisting epoch {}", epoch);
 
         transactional!(&self.cp, |conn| async {
             if let Some(last_epoch) = &data.last_epoch {
@@ -1538,11 +1550,16 @@ WHERE e1.epoch = e2.epoch
                 .await
         }
         .scope_boxed())?;
+        info!("Persisted epoch {}", epoch);
         Ok(())
     }
 
     fn module_cache(&self) -> &Self::ModuleCache {
         &self.module_cache
+    }
+
+    fn indexer_metrics(&self) -> &IndexerMetrics {
+        &self.metrics
     }
 
     async fn get_epochs(
