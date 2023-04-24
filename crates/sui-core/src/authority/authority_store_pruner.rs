@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 use sui_config::node::AuthorityStorePruningConfig;
 use sui_storage::mutex_table::RwLockTable;
+use sui_types::base_types::SequenceNumber;
 use sui_types::messages::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::{
@@ -22,7 +23,7 @@ use sui_types::{
 use tokio::sync::oneshot::{self, Sender};
 use tokio::time::Instant;
 use tracing::log::{debug, error};
-use typed_store::Map;
+use typed_store::{Map, TypedStoreError};
 
 use super::authority_store_tables::AuthorityPerpetualTables;
 
@@ -154,68 +155,54 @@ impl AuthorityStorePruner {
             .get_highest_executed_checkpoint()?
             .map(|c| (c.sequence_number, c.epoch()))
             .unwrap_or_default();
-        let mut checkpoints_in_batch = 0;
-        let mut batch_effects = vec![];
-        let mut network_total_transactions = 0;
 
         debug!(
             "Starting object pruning. Current epoch: {}. Latest pruned checkpoint: {}",
             current_epoch, checkpoint_number
         );
-        let iter = checkpoint_store
-            .certified_checkpoints
-            .iter()
-            .skip_to(&(checkpoint_number + 1))?
-            .map(|(k, ckpt)| (k, ckpt.into_inner()));
 
-        #[allow(clippy::explicit_counter_loop)]
-        for (_, checkpoint) in iter {
-            checkpoint_number = *checkpoint.sequence_number();
-            // Skipping because  checkpoint's epoch or checkpoint number is too new.
-            // We have to respect the highest executed checkpoint watermark because there might be
-            // parts of the system that still require access to old object versions (i.e. state accumulator)
-            if (current_epoch < checkpoint.epoch() + config.num_epochs_to_retain)
-                || (checkpoint_number > highest_executed_checkpoint)
-            {
-                break;
-            }
-            checkpoints_in_batch += 1;
-            if network_total_transactions == checkpoint.network_total_transactions {
-                continue;
-            }
-            network_total_transactions = checkpoint.network_total_transactions;
+        loop {
+            let checkpoints: Vec<_> = checkpoint_store
+                .certified_checkpoints
+                .iter()
+                .skip_to(&(checkpoint_number + 1))?
+                .take(config.max_checkpoints_in_batch)
+                .map(|(_, ckpt)| ckpt.into_inner())
+                // Filtering out transactions whose epoch or checkpoint number is too new.
+                // We have to respect the highest executed checkpoint watermark because there might be
+                // parts of the system that still require access to old object versions (i.e. state accumulator)
+                .filter(|checkpoint| {
+                    checkpoint.epoch() + config.num_epochs_to_retain <= current_epoch
+                        && *checkpoint.sequence_number() <= highest_executed_checkpoint
+                })
+                .collect();
 
-            let content = checkpoint_store
-                .get_checkpoint_contents(&checkpoint.content_digest)?
-                .ok_or_else(|| anyhow::anyhow!("checkpoint content data is missing"))?;
+            checkpoint_number = checkpoints
+                .last()
+                .map(|c| *c.sequence_number())
+                .unwrap_or(checkpoint_number);
+            let is_last_iteration = checkpoints.len() < config.max_checkpoints_in_batch;
+
+            let digests: Vec<_> = checkpoints.into_iter().map(|c| c.content_digest).collect();
+            let execution_digests = checkpoint_store
+                .multi_get_checkpoint_content(&digests)?
+                .into_iter()
+                .flat_map(|contents| {
+                    contents
+                        .expect("checkpoint content is missing")
+                        .into_inner()
+                })
+                .map(|tx| tx.effects);
+
             let effects = perpetual_db
                 .effects
-                .multi_get(content.iter().map(|tx| tx.effects))?;
+                .multi_get(execution_digests)?
+                .into_iter()
+                .map(|effects| effects.expect("missing effects in pruner"))
+                .collect();
 
-            if effects.iter().any(|effect| effect.is_none()) {
-                return Err(anyhow::anyhow!("transaction effects data is missing"));
-            }
-            batch_effects.extend(effects.into_iter().flatten());
-
-            if batch_effects.len() >= config.max_transactions_in_batch
-                || checkpoints_in_batch >= config.max_checkpoints_in_batch
-            {
-                Self::prune_effects(
-                    batch_effects,
-                    perpetual_db,
-                    objects_lock_table,
-                    checkpoint_number,
-                    deletion_method,
-                    metrics.clone(),
-                )
-                .await?;
-                batch_effects = vec![];
-                checkpoints_in_batch = 0;
-            }
-        }
-        if !batch_effects.is_empty() {
             Self::prune_effects(
-                batch_effects,
+                effects,
                 perpetual_db,
                 objects_lock_table,
                 checkpoint_number,
@@ -223,12 +210,11 @@ impl AuthorityStorePruner {
                 metrics.clone(),
             )
             .await?;
+
+            if is_last_iteration {
+                return Ok(());
+            }
         }
-        debug!(
-            "Finished pruner iteration. Latest pruned checkpoint: {}",
-            checkpoint_number
-        );
-        Ok(())
     }
 
     fn setup_objects_pruning(
@@ -244,12 +230,13 @@ impl AuthorityStorePruner {
             "Starting object pruning service with num_epochs_to_retain={}",
             config.num_epochs_to_retain
         );
-        let tick_duration = if config.num_epochs_to_retain > 0 {
-            Duration::from_millis(epoch_duration_ms / 2)
-        } else {
-            Duration::from_secs(config.pruning_run_delay_seconds.unwrap_or(60))
-        };
-
+        let tick_duration = Duration::from_secs(config.pruning_run_delay_seconds.unwrap_or(
+            if config.num_epochs_to_retain > 0 {
+                epoch_duration_ms / 2
+            } else {
+                60
+            },
+        ));
         let pruning_initial_delay = min(tick_duration, Duration::from_secs(300));
         let mut prune_interval =
             tokio::time::interval_at(Instant::now() + pruning_initial_delay, tick_duration);
@@ -287,11 +274,17 @@ impl AuthorityStorePruner {
             ),
         }
     }
+
+    pub fn compact(perpetual_db: &Arc<AuthorityPerpetualTables>) -> Result<(), TypedStoreError> {
+        perpetual_db.objects.compact_range(
+            &ObjectKey(ObjectID::ZERO, SequenceNumber::MIN),
+            &ObjectKey(ObjectID::MAX, SequenceNumber::MAX),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fs_extra::dir::get_size;
     use more_asserts as ma;
     use std::path::Path;
     use std::time::Duration;
@@ -538,7 +531,7 @@ mod tests {
     async fn test_db_size_after_compaction() -> Result<(), anyhow::Error> {
         let primary_path = tempfile::tempdir()?.into_path();
         let perpetual_db = Arc::new(AuthorityPerpetualTables::open(&primary_path, None));
-        let total_unique_object_ids = 100_000;
+        let total_unique_object_ids = 10_000;
         let num_versions_per_object = 10;
         let ids = ObjectID::in_range(ObjectID::ZERO, total_unique_object_ids)?;
         let mut to_delete = vec![];
@@ -553,8 +546,29 @@ mod tests {
                     .insert(&ObjectKey(id, SequenceNumber::from(i)), &obj)?;
             }
         }
+
+        fn get_sst_size(path: &Path) -> u64 {
+            let mut size = 0;
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext != "sst" {
+                        continue;
+                    }
+                    size += std::fs::metadata(path).unwrap().len();
+                }
+            }
+            size
+        }
+
+        let db_path = primary_path.clone().join("perpetual");
+        let start = ObjectKey(ObjectID::ZERO, SequenceNumber::MIN);
+        let end = ObjectKey(ObjectID::MAX, SequenceNumber::MAX);
+
         perpetual_db.objects.rocksdb.flush()?;
-        let before_compaction_size = get_size(primary_path.clone()).unwrap();
+        perpetual_db.objects.compact_range_to_bottom(&start, &end)?;
+        let before_compaction_size = get_sst_size(&db_path);
 
         let mut effects = TransactionEffects::default();
         *effects.modified_at_versions_mut_for_testing() = to_delete;
@@ -570,11 +584,10 @@ mod tests {
         )
         .await;
         info!("Total pruned keys = {:?}", total_pruned);
-        let start = ObjectKey(ObjectID::ZERO, SequenceNumber::MIN);
-        let end = ObjectKey(ObjectID::MAX, SequenceNumber::MAX);
-        perpetual_db.objects.compact_range(&start, &end)?;
 
-        let after_compaction_size = get_size(primary_path).unwrap();
+        perpetual_db.objects.rocksdb.flush()?;
+        perpetual_db.objects.compact_range_to_bottom(&start, &end)?;
+        let after_compaction_size = get_sst_size(&db_path);
 
         info!(
             "Before compaction disk size = {:?}, after compaction disk size = {:?}",

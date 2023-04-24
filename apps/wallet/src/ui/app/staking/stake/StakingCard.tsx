@@ -84,7 +84,7 @@ function StakingCard() {
         [coinType]
     );
 
-    const suiEarned = stakeData?.estimatedReward || 0;
+    const suiEarned = stakeData?.estimatedReward || '0';
 
     const [coinDecimals] = useCoinDecimals(coinType);
     // set minimum stake amount to 1 SUI
@@ -319,16 +319,17 @@ function StakingCard() {
                                             initialIsOpen
                                         >
                                             <Text
-                                                variant="p3"
+                                                variant="pSubtitle"
                                                 color="steel-dark"
                                                 weight="normal"
                                             >
-                                                The staked SUI starts earning
-                                                reward at the end of the Epoch
-                                                in which it was staked. The
-                                                rewards will become available at
-                                                the end of one full Epoch of
-                                                staking.
+                                                Staked SUI starts counting as
+                                                validator’s stake at the end of
+                                                the Epoch in which it was
+                                                staked. Rewards are earned
+                                                separately for each Epoch and
+                                                become available at the end of
+                                                each Epoch.
                                             </Text>
                                         </Collapse>
                                     </div>

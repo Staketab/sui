@@ -1,7 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use move_binary_format::{
     errors::{Location, VMError, VMResult},
@@ -14,7 +17,7 @@ use move_core_types::{
 };
 use move_vm_runtime::{move_vm::MoveVM, session::Session};
 use move_vm_types::loaded_data::runtime_types::Type;
-use sui_framework::natives::object_runtime::{max_event_error, ObjectRuntime, RuntimeResults};
+use sui_move_natives::object_runtime::{max_event_error, ObjectRuntime, RuntimeResults};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
     balance::Balance,
@@ -23,6 +26,7 @@ use sui_types::{
     error::{ExecutionError, ExecutionErrorKind},
     gas::{SuiGasStatus, SuiGasStatusAPI},
     messages::{Argument, CallArg, CommandArgumentError, ObjectArg},
+    metrics::LimitsMetrics,
     move_package::MovePackage,
     object::{MoveObject, Object, Owner},
     storage::{ObjectChange, WriteKind},
@@ -39,9 +43,11 @@ use super::types::*;
 sui_macros::checked_arithmetic! {
 
 /// Maintains all runtime state specific to programmable transactions
-pub struct ExecutionContext<'vm, 'state, 'a, 'b, S: StorageView> {
+pub struct ExecutionContext<'vm, 'state, 'a, S: StorageView> {
     /// The protocol config
     pub protocol_config: &'a ProtocolConfig,
+    /// Metrics for reporting exceeded limits
+    pub metrics: Arc<LimitsMetrics>,
     /// The MoveVM
     pub vm: &'vm MoveVM,
     /// The global state, used for resolving packages
@@ -50,7 +56,7 @@ pub struct ExecutionContext<'vm, 'state, 'a, 'b, S: StorageView> {
     /// creation of new object IDs
     pub tx_context: &'a mut TxContext,
     /// The gas status used for metering
-    pub gas_status: &'a mut SuiGasStatus<'b>,
+    pub gas_status: &'a mut SuiGasStatus,
     /// The session used for interacting with Move types and calls
     pub session: Session<'state, 'vm, LinkageView<'state, S>>,
     /// Additional transfers not from the Move runtime
@@ -85,13 +91,14 @@ struct AdditionalWrite {
     bytes: Vec<u8>,
 }
 
-impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, S> {
+impl<'vm, 'state, 'a, S: StorageView> ExecutionContext<'vm, 'state, 'a, S> {
     pub fn new(
         protocol_config: &'a ProtocolConfig,
+        metrics: Arc<LimitsMetrics>,
         vm: &'vm MoveVM,
         state_view: &'state S,
         tx_context: &'a mut TxContext,
-        gas_status: &'a mut SuiGasStatus<'b>,
+        gas_status: &'a mut SuiGasStatus,
         gas_coin_opt: Option<ObjectID>,
         inputs: Vec<CallArg>,
     ) -> Result<Self, ExecutionError> {
@@ -109,6 +116,7 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
             BTreeMap::new(),
             !gas_status.is_unmetered(),
             protocol_config,
+            metrics.clone(),
         );
         let mut object_owner_map = BTreeMap::new();
         let inputs = inputs
@@ -162,7 +170,7 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
         // exist. Plus, Sui Move does not use these changes or events
         let (res, linkage) = tmp_session.finish();
         let (change_set, move_events) =
-            res.map_err(|e| sui_types::error::convert_vm_error(e, vm, &linkage))?;
+            res.map_err(|e| crate::error::convert_vm_error(e, vm, &linkage))?;
         assert_invariant!(change_set.accounts().is_empty(), "Change set must be empty");
         assert_invariant!(move_events.is_empty(), "Events must be empty");
         // make the real session
@@ -172,9 +180,11 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
             object_owner_map,
             !gas_status.is_unmetered(),
             protocol_config,
+            metrics.clone(),
         );
         Ok(Self {
             protocol_config,
+            metrics,
             vm,
             state_view,
             tx_context,
@@ -274,12 +284,16 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
         let new_events = events
             .into_iter()
             .map(|(ty, tag, value)| {
-                let layout = self.session.type_to_type_layout(&ty)?;
-                let bytes = value.simple_serialize(&layout).unwrap();
+                let layout = self
+                    .session
+                    .type_to_type_layout(&ty)
+                    .map_err(|e| self.convert_vm_error(e))?;
+                let Some(bytes) = value.simple_serialize(&layout) else {
+                    invariant_violation!("Failed to deserialize already serialized Move value");
+                };
                 Ok((module_id.clone(), tag, bytes))
             })
-            .collect::<Result<Vec<_>, VMError>>()
-            .map_err(|e| self.convert_vm_error(e))?;
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
         self.user_events.extend(new_events);
         Ok(())
     }
@@ -472,7 +486,7 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
             storage_id,
             new_modules,
             self.tx_context.digest(),
-            self.protocol_config.max_move_package_size(),
+            self.protocol_config,
             dependencies,
         )
     }
@@ -499,9 +513,10 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
 
     /// Determine the object changes and collect all user events
     pub fn finish<Mode: ExecutionMode>(self) -> Result<ExecutionResults, ExecutionError> {
-        use sui_types::error::convert_vm_error;
+        use crate::error::convert_vm_error;
         let Self {
             protocol_config,
+            metrics,
             vm,
             state_view,
             tx_context,
@@ -522,28 +537,29 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
         // written as it's value might have changed (and eventually it's sequence number will need
         // to increase)
         let mut by_value_inputs = BTreeSet::new();
-        let mut add_input_object_write = |input| {
+        let mut add_input_object_write = |input| -> Result<(), ExecutionError> {
             let InputValue {
                 object_metadata: object_metadata_opt,
                 inner: ResultValue { value, .. },
             } = input;
-            let Some(object_metadata) = object_metadata_opt else { return };
+            let Some(object_metadata) = object_metadata_opt else { return Ok(()) };
             let is_mutable_input = object_metadata.is_mutable_input;
             let owner = object_metadata.owner;
             let id = object_metadata.id;
             input_object_metadata.insert(object_metadata.id, object_metadata);
             let Some(Value::Object(object_value)) = value else {
                 by_value_inputs.insert(id);
-                return
+                return Ok(())
             };
             if is_mutable_input {
-                add_additional_write(&mut additional_writes, owner, object_value);
+                add_additional_write(&mut additional_writes, owner, object_value)?;
             }
+            Ok(())
         };
         let gas_id_opt = gas.object_metadata.as_ref().map(|info| info.id);
-        add_input_object_write(gas);
+        add_input_object_write(gas)?;
         for input in inputs {
-            add_input_object_write(input)
+            add_input_object_write(input)?
         }
         // check for unused values
         // disable this check for dev inspect
@@ -597,7 +613,7 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
         // add transfers from TransferObjects command
         for (recipient, object_value) in additional_transfers {
             let owner = Owner::AddressOwner(recipient);
-            add_additional_write(&mut additional_writes, owner, object_value)
+            add_additional_write(&mut additional_writes, owner, object_value)?;
         }
         // Refund unused gas
         if let Some(gas_id) = gas_id_opt {
@@ -642,6 +658,7 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
             BTreeMap::new(),
             !gas_status.is_unmetered(),
             protocol_config,
+            metrics,
         );
         for (id, additional_write) in additional_writes {
             let AdditionalWrite {
@@ -691,7 +708,9 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
             let layout = tmp_session
                 .type_to_type_layout(&ty)
                 .map_err(|e| convert_vm_error(e, vm, tmp_session.get_resolver()))?;
-            let bytes = value.simple_serialize(&layout).unwrap();
+            let Some(bytes) = value.simple_serialize(&layout) else {
+                invariant_violation!("Failed to deserialize already serialized Move value");
+            };
             // safe because has_public_transfer has been determined by the abilities
             let move_object = unsafe {
                 create_written_object(
@@ -744,7 +763,7 @@ impl<'vm, 'state, 'a, 'b, S: StorageView> ExecutionContext<'vm, 'state, 'a, 'b, 
 
     /// Convert a VM Error to an execution one
     pub fn convert_vm_error(&self, error: VMError) -> ExecutionError {
-        sui_types::error::convert_vm_error(error, self.vm, self.session.get_resolver())
+        crate::error::convert_vm_error(error, self.vm, self.session.get_resolver())
     }
 
     /// Special case errors for type arguments to Move functions
@@ -838,11 +857,12 @@ fn new_session<'state, 'vm, S: StorageView>(
     input_objects: BTreeMap<ObjectID, Owner>,
     is_metered: bool,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
 ) -> Session<'state, 'vm, LinkageView<'state, S>> {
     let store = linkage.storage();
     vm.new_session_with_extensions(
         linkage,
-        new_native_extensions(store, input_objects, is_metered, protocol_config),
+        new_native_extensions(store, input_objects, is_metered, protocol_config, metrics),
     )
 }
 
@@ -1063,7 +1083,7 @@ fn add_additional_write(
     additional_writes: &mut BTreeMap<ObjectID, AdditionalWrite>,
     owner: Owner,
     object_value: ObjectValue,
-) {
+) -> Result<(), ExecutionError> {
     let ObjectValue {
         type_,
         has_public_transfer,
@@ -1074,7 +1094,9 @@ fn add_additional_write(
         ObjectContents::Coin(coin) => coin.to_bcs_bytes(),
         ObjectContents::Raw(bytes) => bytes,
     };
-    let object_id = MoveObject::id_opt(&bytes).unwrap();
+    let object_id = MoveObject::id_opt(&bytes).map_err(|e| {
+        ExecutionError::invariant_violation(format!("No id for Raw object bytes. {e}"))
+    })?;
     let additional_write = AdditionalWrite {
         recipient: owner,
         type_,
@@ -1082,6 +1104,7 @@ fn add_additional_write(
         bytes,
     };
     additional_writes.insert(object_id, additional_write);
+    Ok(())
 }
 
 /// The max budget was deducted from the gas coin at the beginning of the transaction,
@@ -1150,7 +1173,7 @@ unsafe fn create_written_object<S: StorageView>(
 
     let type_tag = session
         .get_type_tag(&type_)
-        .map_err(|e| sui_types::error::convert_vm_error(e, vm, session.get_resolver()))?;
+        .map_err(|e| crate::error::convert_vm_error(e, vm, session.get_resolver()))?;
 
     let struct_tag = match type_tag {
         TypeTag::Struct(inner) => *inner,

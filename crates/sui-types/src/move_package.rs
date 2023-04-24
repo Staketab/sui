@@ -6,19 +6,20 @@ use crate::{
     crypto::DefaultHash,
     error::{ExecutionError, ExecutionErrorKind, SuiError, SuiResult},
     id::{ID, UID},
+    messages::PackageUpgradeError,
     object::OBJECT_START_VERSION,
     SUI_FRAMEWORK_ADDRESS,
 };
 use derive_more::Display;
 use fastcrypto::hash::HashFunction;
-use move_binary_format::binary_views::BinaryIndexedView;
-use move_binary_format::file_format::CompiledModule;
+use move_binary_format::file_format::{Ability, CompiledModule};
 use move_binary_format::normalized;
 use move_binary_format::{
     access::ModuleAccess,
     compatibility::{Compatibility, InclusionCheck},
     errors::PartialVMResult,
 };
+use move_binary_format::{binary_views::BinaryIndexedView, file_format::AbilitySet};
 use move_core_types::{
     account_address::AccountAddress,
     ident_str,
@@ -33,6 +34,7 @@ use serde_json::Value;
 use serde_with::serde_as;
 use serde_with::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
+use sui_protocol_config::ProtocolConfig;
 
 // TODO: robust MovePackage tests
 // #[cfg(test)]
@@ -133,19 +135,30 @@ impl UpgradePolicy {
         Self::try_from(*policy).is_ok()
     }
 
+    fn compatibility_check_for_protocol(protocol_config: &ProtocolConfig) -> Compatibility {
+        let disallowed_new_abilities = if protocol_config.disallow_adding_key_ability() {
+            AbilitySet::singleton(Ability::Key)
+        } else {
+            AbilitySet::EMPTY
+        };
+        Compatibility {
+            check_struct_and_pub_function_linking: true,
+            check_struct_layout: true,
+            check_friend_linking: false,
+            check_private_entry_linking: false,
+            disallowed_new_abilities,
+        }
+    }
+
     pub fn check_compatibility(
         &self,
         old_module: &normalized::Module,
         new_module: &normalized::Module,
+        protocol_config: &ProtocolConfig,
     ) -> PartialVMResult<()> {
         match self {
-            Self::Compatible => Compatibility {
-                check_struct_and_pub_function_linking: true,
-                check_struct_layout: true,
-                check_friend_linking: false,
-                check_private_entry_linking: false,
-            }
-            .check(old_module, new_module),
+            Self::Compatible => Self::compatibility_check_for_protocol(protocol_config)
+                .check(old_module, new_module),
             Self::Additive => InclusionCheck::Subset.check(old_module, new_module),
             Self::DepOnly => InclusionCheck::Equal.check(old_module, new_module),
         }
@@ -278,14 +291,15 @@ impl MovePackage {
         &self,
         storage_id: ObjectID,
         modules: &[CompiledModule],
-        max_move_package_size: u64,
+        protocol_config: &ProtocolConfig,
         transitive_dependencies: impl IntoIterator<Item = &'p MovePackage>,
     ) -> Result<Self, ExecutionError> {
         let module = modules
             .first()
             .expect("Tried to build a Move package from an empty iterator of Compiled modules");
         let runtime_id = ObjectID::from(*module.address());
-        let type_origin_table = build_upgraded_type_origin_table(self, modules, storage_id)?;
+        let type_origin_table =
+            build_upgraded_type_origin_table(self, modules, storage_id, protocol_config)?;
         let mut new_version = self.version();
         new_version.increment();
         Self::from_module_iter_with_type_origin_table(
@@ -293,7 +307,7 @@ impl MovePackage {
             runtime_id,
             new_version,
             modules,
-            max_move_package_size,
+            protocol_config.max_move_package_size(),
             type_origin_table,
             transitive_dependencies,
         )
@@ -551,6 +565,18 @@ impl UpgradeReceipt {
     }
 }
 
+/// Checks if a function is annotated with one of the test-related annotations
+pub fn is_test_fun(name: &IdentStr, module: &CompiledModule, fn_info_map: &FnInfoMap) -> bool {
+    let fn_name = name.to_string();
+    let mod_handle = module.self_handle();
+    let mod_addr = *module.address_identifier_at(mod_handle.address);
+    let fn_info_key = FnInfoKey { fn_name, mod_addr };
+    match fn_info_map.get(&fn_info_key) {
+        Some(fn_info) => fn_info.is_test,
+        None => false,
+    }
+}
+
 pub fn disassemble_modules<'a, I>(modules: I) -> SuiResult<BTreeMap<String, Value>>
 where
     I: Iterator<Item = &'a Vec<u8>>,
@@ -683,6 +709,7 @@ fn build_upgraded_type_origin_table(
     predecessor: &MovePackage,
     modules: &[CompiledModule],
     storage_id: ObjectID,
+    protocol_config: &ProtocolConfig,
 ) -> Result<Vec<TypeOrigin>, ExecutionError> {
     let mut new_table = vec![];
     let mut existing_table = predecessor.type_origin_map();
@@ -704,9 +731,17 @@ fn build_upgraded_type_origin_table(
     }
 
     if !existing_table.is_empty() {
-        Err(ExecutionError::invariant_violation(
-            "Package upgrade missing type from previous version.",
-        ))
+        if protocol_config.missing_type_is_compatibility_error() {
+            Err(ExecutionError::from_kind(
+                ExecutionErrorKind::PackageUpgradeError {
+                    upgrade_error: PackageUpgradeError::IncompatibleUpgrade,
+                },
+            ))
+        } else {
+            Err(ExecutionError::invariant_violation(
+                "Package upgrade missing type from previous version.",
+            ))
+        }
     } else {
         Ok(new_table)
     }

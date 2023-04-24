@@ -3,8 +3,10 @@
 
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::AuthorityStore;
+use crate::transaction_signing_filter;
 use std::collections::{BTreeMap, HashSet};
 use sui_adapter::adapter::run_metered_move_bytecode_verifier;
+use sui_config::transaction_deny_config::TransactionDenyConfig;
 use sui_macros::checked_arithmetic;
 use sui_protocol_config::ProtocolConfig;
 use sui_types::base_types::ObjectRef;
@@ -34,7 +36,7 @@ async fn get_gas_status(
     gas: &[ObjectRef],
     epoch_store: &AuthorityPerEpochStore,
     transaction: &TransactionData,
-) -> SuiResult<SuiGasStatus<'static>> {
+) -> SuiResult<SuiGasStatus> {
     // Get the first coin (possibly the only one) and make it "the gas coin", then
     // keep track of all others that can contribute to gas (gas smashing).
     let gas_object_ref = gas.get(0).unwrap();
@@ -58,11 +60,18 @@ pub async fn check_transaction_input(
     store: &AuthorityStore,
     epoch_store: &AuthorityPerEpochStore,
     transaction: &TransactionData,
-) -> SuiResult<(SuiGasStatus<'static>, InputObjects)> {
+    transaction_deny_config: &TransactionDenyConfig,
+) -> SuiResult<(SuiGasStatus, InputObjects)> {
     transaction.check_version_supported(epoch_store.protocol_config())?;
     transaction.validity_check(epoch_store.protocol_config())?;
     check_non_system_packages_to_be_published(transaction, epoch_store.protocol_config())?;
     let input_objects = transaction.input_objects()?;
+    transaction_signing_filter::check_transaction_for_signing(
+        transaction,
+        &input_objects,
+        transaction_deny_config,
+        store,
+    )?;
     let objects = store.check_input_objects(&input_objects, epoch_store.protocol_config())?;
     let gas_status = get_gas_status(&objects, transaction.gas(), epoch_store, transaction).await?;
     let input_objects = check_objects(transaction, input_objects, objects)?;
@@ -74,7 +83,7 @@ pub async fn check_transaction_input_with_given_gas(
     epoch_store: &AuthorityPerEpochStore,
     transaction: &TransactionData,
     gas_object: Object,
-) -> SuiResult<(SuiGasStatus<'static>, InputObjects)> {
+) -> SuiResult<(SuiGasStatus, InputObjects)> {
     transaction.check_version_supported(epoch_store.protocol_config())?;
     transaction.validity_check_no_gas_check(epoch_store.protocol_config())?;
     check_non_system_packages_to_be_published(transaction, epoch_store.protocol_config())?;
@@ -132,7 +141,7 @@ pub async fn check_certificate_input(
     store: &AuthorityStore,
     epoch_store: &AuthorityPerEpochStore,
     cert: &VerifiedExecutableTransaction,
-) -> SuiResult<(SuiGasStatus<'static>, InputObjects)> {
+) -> SuiResult<(SuiGasStatus, InputObjects)> {
     let protocol_version = epoch_store.protocol_version();
 
     // This should not happen - validators should not have signed the txn in the first place.
@@ -172,7 +181,7 @@ async fn check_gas(
     gas_budget: u64,
     gas_price: u64,
     tx_kind: &TransactionKind,
-) -> SuiResult<SuiGasStatus<'static>> {
+) -> SuiResult<SuiGasStatus> {
     let protocol_config = epoch_store.protocol_config();
     if tx_kind.is_system_tx() {
         Ok(SuiGasStatus::new_unmetered(protocol_config))
@@ -183,6 +192,12 @@ async fn check_gas(
             return Err(UserInputError::GasPriceUnderRGP {
                 gas_price,
                 reference_gas_price,
+            }
+            .into());
+        }
+        if protocol_config.gas_model_version() >= 4 && gas_price >= protocol_config.max_gas_price() {
+            return Err(UserInputError::GasPriceTooHigh {
+                max_gas_price: protocol_config.max_gas_price(),
             }
             .into());
         }

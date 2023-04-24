@@ -5,7 +5,7 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee_proc_macros::rpc;
 
 use sui_json_rpc_types::{
-    DynamicFieldPage, EventFilter, EventPage, ObjectsPage, SuiEvent, SuiObjectResponse,
+    DynamicFieldPage, EventFilter, EventPage, ObjectsPage, Page, SuiEvent, SuiObjectResponse,
     SuiObjectResponseQuery, SuiTransactionBlockResponseQuery, TransactionBlocksPage,
 };
 use sui_open_rpc_macros::open_rpc;
@@ -22,8 +22,8 @@ pub trait IndexerApi {
     /// the pagination is not accurate, because previous page may have been updated when
     /// the next page is fetched.
     /// Please use suix_queryObjects if this is a concern.
-    #[method(name = "getOwnedObjects", blocking)]
-    fn get_owned_objects(
+    #[method(name = "getOwnedObjects")]
+    async fn get_owned_objects(
         &self,
         /// the owner's Sui address
         address: SuiAddress,
@@ -36,8 +36,8 @@ pub trait IndexerApi {
     ) -> RpcResult<ObjectsPage>;
 
     /// Return list of transactions for a specified query criteria.
-    #[method(name = "queryTransactionBlocks", blocking)]
-    fn query_transaction_blocks(
+    #[method(name = "queryTransactionBlocks")]
+    async fn query_transaction_blocks(
         &self,
         /// the transaction query criteria.
         query: SuiTransactionBlockResponseQuery,
@@ -50,8 +50,8 @@ pub trait IndexerApi {
     ) -> RpcResult<TransactionBlocksPage>;
 
     /// Return list of events for a specified query criteria.
-    #[method(name = "queryEvents", blocking)]
-    fn query_events(
+    #[method(name = "queryEvents")]
+    async fn query_events(
         &self,
         /// the event query criteria.
         query: EventFilter,
@@ -72,8 +72,8 @@ pub trait IndexerApi {
     );
 
     /// Return the list of dynamic field objects owned by an object.
-    #[method(name = "getDynamicFields", blocking)]
-    fn get_dynamic_fields(
+    #[method(name = "getDynamicFields")]
+    async fn get_dynamic_fields(
         &self,
         /// The ID of the parent object
         parent_object_id: ObjectID,
@@ -84,12 +84,31 @@ pub trait IndexerApi {
     ) -> RpcResult<DynamicFieldPage>;
 
     /// Return the dynamic field object information for a specified object
-    #[method(name = "getDynamicFieldObject", blocking)]
-    fn get_dynamic_field_object(
+    #[method(name = "getDynamicFieldObject")]
+    async fn get_dynamic_field_object(
         &self,
         /// The ID of the queried parent object
         parent_object_id: ObjectID,
         /// The Name of the dynamic field
         name: DynamicFieldName,
     ) -> RpcResult<SuiObjectResponse>;
+
+    /// Return the resolved address given resolver and name
+    #[method(name = "resolveNameServiceAddress")]
+    async fn resolve_name_service_address(
+        &self,
+        /// The name to resolve
+        name: String,
+    ) -> RpcResult<Option<SuiAddress>>;
+
+    /// Return the resolved names given address,
+    /// if multiple names are resolved, the first one is the primary name.
+    #[method(name = "resolveNameServiceNames")]
+    async fn resolve_name_service_names(
+        &self,
+        /// The address to resolve
+        address: SuiAddress,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+    ) -> RpcResult<Page<String, ObjectID>>;
 }

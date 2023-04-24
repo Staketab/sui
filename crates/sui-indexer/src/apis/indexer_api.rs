@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use futures::executor::block_on;
 use futures::future::join_all;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
@@ -318,7 +317,7 @@ impl<S> IndexerApiServer for IndexerApi<S>
 where
     S: IndexerStore + Sync + Send + 'static,
 {
-    fn get_owned_objects(
+    async fn get_owned_objects(
         &self,
         address: SuiAddress,
         query: Option<SuiObjectResponseQuery>,
@@ -334,17 +333,17 @@ where
                 .indexer_metrics()
                 .get_owned_objects_latency
                 .start_timer();
-            let owned_obj_resp = block_on(
-                self.fullnode
-                    .get_owned_objects(address, query, cursor, limit),
-            );
+            let owned_obj_resp = self
+                .fullnode
+                .get_owned_objects(address, query, cursor, limit)
+                .await;
             owned_obj_guard.stop_and_record();
             return owned_obj_resp;
         }
-        block_on(self.get_owned_objects_internal(address, query, cursor, limit))
+        self.get_owned_objects_internal(address, query, cursor, limit)
+            .await
     }
-
-    fn query_transaction_blocks(
+    async fn query_transaction_blocks(
         &self,
         query: SuiTransactionBlockResponseQuery,
         cursor: Option<TransactionDigest>,
@@ -360,24 +359,19 @@ where
                 .indexer_metrics()
                 .query_transaction_blocks_latency
                 .start_timer();
-            let query_tx_resp = block_on(self.fullnode.query_transaction_blocks(
-                query,
-                cursor,
-                limit,
-                descending_order,
-            ));
+            let query_tx_resp = self
+                .fullnode
+                .query_transaction_blocks(query, cursor, limit, descending_order)
+                .await;
             query_tx_guard.stop_and_record();
             return query_tx_resp;
         }
-        Ok(block_on(self.query_transaction_blocks_internal(
-            query,
-            cursor,
-            limit,
-            descending_order,
-        ))?)
+        Ok(self
+            .query_transaction_blocks_internal(query, cursor, limit, descending_order)
+            .await?)
     }
 
-    fn query_events(
+    async fn query_events(
         &self,
         query: EventFilter,
         // exclusive cursor if `Some`, otherwise start from the beginning
@@ -385,29 +379,25 @@ where
         limit: Option<usize>,
         descending_order: Option<bool>,
     ) -> RpcResult<EventPage> {
-        if self.migrated_methods.contains(&"query_events".to_string()) {
+        if !self.migrated_methods.contains(&"query_events".to_string()) {
             let query_events_guard = self
                 .state
                 .indexer_metrics()
                 .query_events_latency
                 .start_timer();
-            let query_events_resp =
-                block_on(
-                    self.fullnode
-                        .query_events(query, cursor, limit, descending_order),
-                );
+            let query_events_resp = self
+                .fullnode
+                .query_events(query, cursor, limit, descending_order)
+                .await;
             query_events_guard.stop_and_record();
             return query_events_resp;
         }
-        Ok(block_on(self.query_events_internal(
-            query,
-            cursor,
-            limit,
-            descending_order,
-        ))?)
+        Ok(self
+            .query_events_internal(query, cursor, limit, descending_order)
+            .await?)
     }
 
-    fn get_dynamic_fields(
+    async fn get_dynamic_fields(
         &self,
         parent_object_id: ObjectID,
         cursor: Option<ObjectID>,
@@ -418,15 +408,15 @@ where
             .indexer_metrics()
             .get_dynamic_fields_latency
             .start_timer();
-        let df_resp = block_on(
-            self.fullnode
-                .get_dynamic_fields(parent_object_id, cursor, limit),
-        );
+        let df_resp = self
+            .fullnode
+            .get_dynamic_fields(parent_object_id, cursor, limit)
+            .await;
         df_guard.stop_and_record();
         df_resp
     }
 
-    fn get_dynamic_field_object(
+    async fn get_dynamic_field_object(
         &self,
         parent_object_id: ObjectID,
         name: DynamicFieldName,
@@ -436,10 +426,10 @@ where
             .indexer_metrics()
             .get_dynamic_field_object_latency
             .start_timer();
-        let df_obj_resp = block_on(
-            self.fullnode
-                .get_dynamic_field_object(parent_object_id, name),
-        );
+        let df_obj_resp = self
+            .fullnode
+            .get_dynamic_field_object(parent_object_id, name)
+            .await;
         df_obj_guard.stop_and_record();
         df_obj_resp
     }
@@ -447,6 +437,21 @@ where
     fn subscribe_event(&self, sink: SubscriptionSink, filter: EventFilter) -> SubscriptionResult {
         spawn_subscription(sink, self.event_handler.subscribe(filter));
         Ok(())
+    }
+
+    async fn resolve_name_service_address(&self, _name: String) -> RpcResult<Option<SuiAddress>> {
+        // TODO(gegaowp): implement name service resolver in indexer
+        todo!()
+    }
+
+    async fn resolve_name_service_names(
+        &self,
+        _address: SuiAddress,
+        _cursor: Option<ObjectID>,
+        _limit: Option<usize>,
+    ) -> RpcResult<Page<String, ObjectID>> {
+        // TODO(gegaowp): implement name service resolver in indexer
+        todo!()
     }
 }
 

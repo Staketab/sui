@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::authority::test_authority_builder::TestAuthorityBuilder;
 use crate::{authority::AuthorityState, authority_client::AuthorityAPI};
 use async_trait::async_trait;
 use mysten_metrics::spawn_monitored_task;
@@ -14,7 +15,6 @@ use sui_config::genesis::Genesis;
 use sui_types::messages::TransactionEvents;
 use sui_types::sui_system_state::SuiSystemState;
 use sui_types::{
-    committee::Committee,
     crypto::AuthorityKeyPair,
     error::SuiError,
     messages::{
@@ -113,8 +113,11 @@ impl AuthorityAPI for LocalAuthorityClient {
 }
 
 impl LocalAuthorityClient {
-    pub async fn new(committee: Committee, secret: AuthorityKeyPair, genesis: &Genesis) -> Self {
-        let state = AuthorityState::new_for_testing(committee, &secret, None, genesis).await;
+    pub async fn new(secret: AuthorityKeyPair, genesis: &Genesis) -> Self {
+        let state = TestAuthorityBuilder::new()
+            .with_genesis_and_keypair(genesis, &secret)
+            .build()
+            .await;
         Self {
             state,
             fault_config: LocalAuthorityClientFaultConfig::default(),
@@ -147,7 +150,7 @@ impl LocalAuthorityClient {
                 Ok(Some(effects)) => effects,
                 _ => {
                     let certificate = certificate.verify(epoch_store.committee())?;
-                    state.try_execute_for_test(&certificate).await?
+                    state.try_execute_for_test(&certificate).await?.0
                 }
             }
             .into_inner();

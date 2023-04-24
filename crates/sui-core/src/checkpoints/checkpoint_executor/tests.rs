@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use fastcrypto::traits::KeyPair;
 use sui_config::node::ExpensiveSafetyCheckConfig;
 use sui_types::gas::GasCostSummary;
 use tempfile::tempdir;
@@ -16,6 +15,7 @@ use sui_types::committee::ProtocolVersion;
 use sui_types::messages_checkpoint::{ECMHLiveObjectSetDigest, EndOfEpochData, VerifiedCheckpoint};
 use tokio::{sync::broadcast, time::timeout};
 
+use crate::authority::test_authority_builder::TestAuthorityBuilder;
 use crate::{
     authority::AuthorityState, checkpoints::CheckpointStore, state_accumulator::StateAccumulator,
 };
@@ -385,16 +385,11 @@ async fn init_executor_test(
     Sender<VerifiedCheckpoint>,
     CommitteeFixture,
 ) {
-    let dir = tempfile::TempDir::new().unwrap();
-    let network_config = sui_config::builder::ConfigBuilder::new(&dir).build();
-    let genesis = network_config.genesis;
-    let committee = CommitteeFixture::generate(rand::rngs::OsRng, 0, 4);
-    let keypair = network_config.validator_configs[0]
-        .protocol_key_pair()
-        .copy();
-    let state =
-        AuthorityState::new_for_testing(committee.committee().clone(), &keypair, None, &genesis)
-            .await;
+    let network_config = sui_config::builder::ConfigBuilder::new_with_temp_dir().build();
+    let state = TestAuthorityBuilder::new()
+        .with_network_config(&network_config)
+        .build()
+        .await;
 
     let (checkpoint_sender, _): (Sender<VerifiedCheckpoint>, Receiver<VerifiedCheckpoint>) =
         broadcast::channel(buffer_size);
@@ -409,7 +404,13 @@ async fn init_executor_test(
         state.transaction_manager().clone(),
         accumulator.clone(),
     );
-    (state, executor, accumulator, checkpoint_sender, committee)
+    (
+        state,
+        executor,
+        accumulator,
+        checkpoint_sender,
+        CommitteeFixture::from_network_config(&network_config),
+    )
 }
 
 /// Creates and simulates syncing of a new checkpoint by StateSync, i.e. new

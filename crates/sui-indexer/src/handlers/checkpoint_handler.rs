@@ -48,7 +48,7 @@ use crate::IndexerConfig;
 const MAX_PARALLEL_DOWNLOADS: usize = 24;
 const DOWNLOAD_RETRY_INTERVAL_IN_SECS: u64 = 10;
 const DB_COMMIT_RETRY_INTERVAL_IN_MILLIS: u64 = 100;
-const MULTI_GET_CHUNK_SIZE: usize = 200;
+const MULTI_GET_CHUNK_SIZE: usize = 50;
 const CHECKPOINT_QUEUE_LIMIT: usize = 24;
 const EPOCH_QUEUE_LIMIT: usize = 2;
 
@@ -217,6 +217,14 @@ where
                 if let Ok(checkpoint) = download_result {
                     downloaded_checkpoints.push(checkpoint);
                 } else {
+                    if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) =
+                        download_result
+                    {
+                        warn!(
+                            "Unexpected response from fullnode for object checkpoints: {}",
+                            fn_e
+                        );
+                    }
                     break;
                 }
             }
@@ -227,6 +235,7 @@ where
             current_parallel_downloads =
                 std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
             if downloaded_checkpoints.is_empty() {
+                warn!("No object checkpoints downloaded, retrying in next iteration ...");
                 continue;
             }
 
@@ -292,6 +301,14 @@ where
                 if let Ok(checkpoint) = download_result {
                     downloaded_checkpoints.push(checkpoint);
                 } else {
+                    if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) =
+                        download_result
+                    {
+                        warn!(
+                            "Unexpected response from fullnode for checkpoints: {}",
+                            fn_e
+                        );
+                    }
                     break;
                 }
             }
@@ -303,6 +320,7 @@ where
             current_parallel_downloads =
                 std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
             if downloaded_checkpoints.is_empty() {
+                warn!("No checkpoints downloaded, retrying in next iteration ...");
                 continue;
             }
 
@@ -347,14 +365,15 @@ where
                 // otherwise send it to channel to be committed later.
                 if epoch.last_epoch.is_none() {
                     let epoch_db_guard = self.metrics.epoch_db_commit_latency.start_timer();
+                    info!("Persisting first epoch...");
                     let mut persist_first_epoch_res = self.state.persist_epoch(&epoch).await;
                     while persist_first_epoch_res.is_err() {
                         warn!("Failed to persist first epoch, retrying...");
                         persist_first_epoch_res = self.state.persist_epoch(&epoch).await;
                     }
-                    self.state.persist_epoch(&epoch).await?;
                     epoch_db_guard.stop_and_record();
                     self.metrics.total_epoch_committed.inc();
+                    info!("Persisted first epoch");
                 } else {
                     let epoch_sender_guard = self.epoch_sender.lock().await;
                     // NOTE: when the channel is full, epoch_sender_guard will wait until the channel has space.
@@ -407,9 +426,9 @@ where
                     object_changes: _tx_object_changes,
                     addresses: _,
                     packages,
-                    input_objects,
-                    move_calls,
-                    recipients,
+                    input_objects: _,
+                    move_calls: _,
+                    recipients: _,
                 } = indexed_checkpoint;
                 let checkpoint_seq = checkpoint.sequence_number;
 
@@ -466,31 +485,33 @@ where
                     }
                 });
 
-                let transactions_handler = self.clone();
-                spawn_monitored_task!(async move {
-                    let mut transaction_index_tables_commit_res = transactions_handler
-                        .state
-                        .persist_transaction_index_tables(&input_objects, &move_calls, &recipients)
-                        .await;
-                    while let Err(e) = transaction_index_tables_commit_res {
-                        warn!(
-                            "Indexer transaction index tables commit failed with error: {:?}, retrying after {:?} milli-secs...",
-                            e, DB_COMMIT_RETRY_INTERVAL_IN_MILLIS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            DB_COMMIT_RETRY_INTERVAL_IN_MILLIS,
-                        ))
-                        .await;
-                        transaction_index_tables_commit_res = transactions_handler
-                            .state
-                            .persist_transaction_index_tables(
-                                &input_objects,
-                                &move_calls,
-                                &recipients,
-                            )
-                            .await;
-                    }
-                });
+                // MUSTFIX(gegaowp): temp. turn off tx index table commit to reduce short-term storage consumption.
+                // this include recipients, input_objects and move_calls.
+                // let transactions_handler = self.clone();
+                // spawn_monitored_task!(async move {
+                //     let mut transaction_index_tables_commit_res = transactions_handler
+                //         .state
+                //         .persist_transaction_index_tables(&input_objects, &move_calls, &recipients)
+                //         .await;
+                //     while let Err(e) = transaction_index_tables_commit_res {
+                //         warn!(
+                //             "Indexer transaction index tables commit failed with error: {:?}, retrying after {:?} milli-secs...",
+                //             e, DB_COMMIT_RETRY_INTERVAL_IN_MILLIS
+                //         );
+                //         tokio::time::sleep(std::time::Duration::from_millis(
+                //             DB_COMMIT_RETRY_INTERVAL_IN_MILLIS,
+                //         ))
+                //         .await;
+                //         transaction_index_tables_commit_res = transactions_handler
+                //             .state
+                //             .persist_transaction_index_tables(
+                //                 &input_objects,
+                //                 &move_calls,
+                //                 &recipients,
+                //             )
+                //             .await;
+                //     }
+                // });
 
                 let checkpoint_tx_db_guard =
                     self.metrics.checkpoint_db_commit_latency.start_timer();
@@ -513,6 +534,9 @@ where
                         .await;
                 }
                 checkpoint_tx_db_guard.stop_and_record();
+                self.metrics
+                    .latest_indexer_checkpoint_sequence_number
+                    .set(checkpoint_seq);
 
                 self.metrics.total_checkpoint_committed.inc();
                 let tx_count = transactions.len();
@@ -588,6 +612,9 @@ where
                 self.metrics
                     .total_object_change_committed
                     .inc_by(tx_object_changes.len() as u64);
+                self.metrics
+                    .latest_indexer_object_checkpoint_sequence_number
+                    .set(checkpoint_seq);
             } else {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -635,6 +662,20 @@ where
         seq: CheckpointSequenceNumber,
         skip_object: bool,
     ) -> Result<CheckpointData, IndexerError> {
+        let latest_fn_checkpoint_seq = self
+            .http_client
+            .get_latest_checkpoint_sequence_number()
+            .await
+            .map_err(|e| {
+                IndexerError::FullNodeReadingError(format!(
+                    "Failed to get latest checkpoint sequence number and error {:?}",
+                    e
+                ))
+            })?;
+        self.metrics
+            .latest_fullnode_checkpoint_sequence_number
+            .set((*latest_fn_checkpoint_seq) as i64);
+
         let mut checkpoint = self
             .http_client
             .get_checkpoint(seq.into())

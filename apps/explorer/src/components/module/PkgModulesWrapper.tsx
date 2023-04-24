@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Combobox } from '@headlessui/react';
+import { Search24 } from '@mysten/icons';
 import clsx from 'clsx';
 import { useState, useCallback, useEffect } from 'react';
+import { type Direction } from 'react-resizable-panels';
 
 import ModuleView from './ModuleView';
 import { ModuleFunctionsInteraction } from './module-functions-interaction';
 
-import { ReactComponent as SearchIcon } from '~/assets/SVGIcons/24px/Search.svg';
 import { useBreakpoint } from '~/hooks/useBreakpoint';
 import { SplitPanes } from '~/ui/SplitPanes';
 import { Tab, TabGroup, TabList, TabPanel, TabPanels } from '~/ui/Tabs';
@@ -20,6 +21,7 @@ type ModuleType = [moduleName: string, code: string];
 interface Props {
     id?: string;
     modules: ModuleType[];
+    splitPanelOrientation: Direction;
 }
 
 interface ModuleViewWrapperProps {
@@ -46,7 +48,7 @@ function ModuleViewWrapper({
     return <ModuleView id={id} name={name} code={code} />;
 }
 
-function PkgModuleViewWrapper({ id, modules }: Props) {
+function PkgModuleViewWrapper({ id, modules, splitPanelOrientation }: Props) {
     const isMediumOrAbove = useBreakpoint('md');
 
     const modulenames = modules.map(([name]) => name);
@@ -96,7 +98,7 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
     const bytecodeContent = [
         <div
             key="bytecode"
-            className="grow overflow-auto border-gray-45 pt-5 md:pl-7"
+            className="h-full grow overflow-auto border-gray-45 pt-5 md:pl-7"
         >
             <TabGroup size="md">
                 <TabList>
@@ -104,7 +106,14 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
                 </TabList>
                 <TabPanels>
                     <TabPanel>
-                        <div className="h-verticalListLong overflow-auto">
+                        <div
+                            className={clsx(
+                                'overflow-auto',
+                                (splitPanelOrientation === 'horizontal' ||
+                                    !isMediumOrAbove) &&
+                                    'h-verticalListLong'
+                            )}
+                        >
                             <ModuleViewWrapper
                                 id={id}
                                 modules={modules}
@@ -117,7 +126,7 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
         </div>,
         <div
             key="execute"
-            className="grow overflow-auto border-gray-45 pt-5 md:pl-7"
+            className="h-full grow overflow-auto border-gray-45 pt-5 md:pl-7"
         >
             <TabGroup size="md">
                 <TabList>
@@ -125,7 +134,14 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
                 </TabList>
                 <TabPanels>
                     <TabPanel>
-                        <div className="h-verticalListLong overflow-auto">
+                        <div
+                            className={clsx(
+                                'overflow-auto',
+                                (splitPanelOrientation === 'horizontal' ||
+                                    !isMediumOrAbove) &&
+                                    'h-verticalListLong'
+                            )}
+                        >
                             {id && selectedModule ? (
                                 <ModuleFunctionsInteraction
                                     // force recreating everything when we change modules
@@ -142,7 +158,7 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
     ];
 
     return (
-        <div className="flex flex-col gap-5 border-y border-gray-45 md:flex-row md:flex-nowrap">
+        <div className="flex flex-col gap-5 border-b border-gray-45 md:flex-row md:flex-nowrap">
             <div className="w-full md:w-1/5">
                 <Combobox value={selectedModule} onChange={onChangeModule}>
                     <div className="mt-2.5 flex w-full justify-between rounded-md border border-gray-50 py-1 pl-3 placeholder-gray-65 shadow-sm">
@@ -157,7 +173,7 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
                             className="border-none bg-inherit pr-2"
                             type="submit"
                         >
-                            <SearchIcon className="h-4.5 w-4.5 cursor-pointer fill-steel align-middle" />
+                            <Search24 className="h-4.5 w-4.5 cursor-pointer fill-steel align-middle text-gray-60" />
                         </button>
                     </div>
                     <Combobox.Options className="absolute left-0 z-10 flex h-fit max-h-verticalListLong w-full flex-col gap-1 overflow-auto rounded-md bg-white px-2 pb-5 pt-3 shadow-moduleOption md:left-auto md:w-1/6">
@@ -217,7 +233,7 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
             {isMediumOrAbove ? (
                 <div className="w-4/5">
                     <SplitPanes
-                        direction="horizontal"
+                        direction={splitPanelOrientation}
                         defaultSizes={[40, 60]}
                         panels={bytecodeContent}
                     />

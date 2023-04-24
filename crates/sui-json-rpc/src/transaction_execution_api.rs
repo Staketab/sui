@@ -10,6 +10,7 @@ use fastcrypto::traits::ToFromBytes;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::RpcModule;
 
+use crate::api::JsonRpcMetrics;
 use mysten_metrics::spawn_monitored_task;
 use shared_crypto::intent::Intent;
 use sui_core::authority::AuthorityState;
@@ -40,15 +41,18 @@ use crate::{
 pub struct TransactionExecutionApi {
     state: Arc<AuthorityState>,
     transaction_orchestrator: Arc<TransactiondOrchestrator<NetworkAuthorityClient>>,
+    metrics: Arc<JsonRpcMetrics>,
 }
 impl TransactionExecutionApi {
     pub fn new(
         state: Arc<AuthorityState>,
         transaction_orchestrator: Arc<TransactiondOrchestrator<NetworkAuthorityClient>>,
+        metrics: Arc<JsonRpcMetrics>,
     ) -> Self {
         Self {
             state,
             transaction_orchestrator,
+            metrics,
         }
     }
 
@@ -97,6 +101,7 @@ impl TransactionExecutionApi {
         };
 
         let transaction_orchestrator = self.transaction_orchestrator.clone();
+        let orch_timer = self.metrics.orchestrator_latency_ms.start_timer();
         let response = spawn_monitored_task!(transaction_orchestrator.execute_transaction_block(
             ExecuteTransactionRequest {
                 transaction: txn,
@@ -104,68 +109,63 @@ impl TransactionExecutionApi {
             }
         ))
         .await??;
+        drop(orch_timer);
 
-        match response {
-            ExecuteTransactionResponse::EffectsCert(cert) => {
-                let (effects, transaction_events, is_executed_locally) = *cert;
-                let mut events: Option<SuiTransactionBlockEvents> = None;
-                if opts.show_events {
-                    let module_cache = self
-                        .state
-                        .load_epoch_store_one_call_per_task()
-                        .module_cache()
-                        .clone();
-                    events = Some(SuiTransactionBlockEvents::try_from(
-                        transaction_events,
-                        digest,
-                        None,
-                        module_cache.as_ref(),
-                    )?);
-                }
-
-                let object_cache = ObjectProviderCache::new(self.state.clone());
-                let balance_changes = if opts.show_balance_changes {
-                    Some(
-                        get_balance_changes_from_effect(
-                            &object_cache,
-                            &effects.effects,
-                            input_objs,
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-                let object_changes = if opts.show_object_changes {
-                    Some(
-                        get_object_changes(
-                            &object_cache,
-                            sender,
-                            effects.effects.modified_at_versions(),
-                            effects.effects.all_changed_objects(),
-                            effects.effects.all_deleted(),
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-
-                Ok(SuiTransactionBlockResponse {
-                    digest,
-                    transaction,
-                    raw_transaction,
-                    effects: opts.show_effects.then_some(effects.effects.try_into()?),
-                    events,
-                    object_changes,
-                    balance_changes,
-                    timestamp_ms: None,
-                    confirmed_local_execution: Some(is_executed_locally),
-                    checkpoint: None,
-                    errors: vec![],
-                })
-            }
+        let _post_orch_timer = self.metrics.post_orchestrator_latency_ms.start_timer();
+        let ExecuteTransactionResponse::EffectsCert(cert) = response;
+        let (effects, transaction_events, is_executed_locally) = *cert;
+        let mut events: Option<SuiTransactionBlockEvents> = None;
+        if opts.show_events {
+            let module_cache = self
+                .state
+                .load_epoch_store_one_call_per_task()
+                .module_cache()
+                .clone();
+            events = Some(SuiTransactionBlockEvents::try_from(
+                transaction_events,
+                digest,
+                None,
+                module_cache.as_ref(),
+            )?);
         }
+
+        let object_cache = ObjectProviderCache::new(self.state.clone());
+        let balance_changes = if opts.show_balance_changes {
+            Some(
+                get_balance_changes_from_effect(&object_cache, &effects.effects, input_objs, None)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let object_changes = if opts.show_object_changes {
+            Some(
+                get_object_changes(
+                    &object_cache,
+                    sender,
+                    effects.effects.modified_at_versions(),
+                    effects.effects.all_changed_objects(),
+                    effects.effects.all_deleted(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(SuiTransactionBlockResponse {
+            digest,
+            transaction,
+            raw_transaction,
+            effects: opts.show_effects.then_some(effects.effects.try_into()?),
+            events,
+            object_changes,
+            balance_changes,
+            timestamp_ms: None,
+            confirmed_local_execution: Some(is_executed_locally),
+            checkpoint: None,
+            errors: vec![],
+        })
     }
 
     async fn dry_run_transaction_block(
@@ -175,14 +175,18 @@ impl TransactionExecutionApi {
         let (txn_data, txn_digest) = get_transaction_data_and_digest(tx_bytes)?;
         let input_objs = txn_data.input_objects()?;
         let sender = txn_data.sender();
-        let (resp, written_objects, transaction_effects) = self
+        let (resp, written_objects, transaction_effects, mock_gas) = self
             .state
             .dry_exec_transaction(txn_data.clone(), txn_digest)
             .await?;
         let object_cache = ObjectProviderCache::new_with_cache(self.state.clone(), written_objects);
-        let balance_changes =
-            get_balance_changes_from_effect(&object_cache, &transaction_effects, input_objs)
-                .await?;
+        let balance_changes = get_balance_changes_from_effect(
+            &object_cache,
+            &transaction_effects,
+            input_objs,
+            mock_gas,
+        )
+        .await?;
         let object_changes = get_object_changes(
             &object_cache,
             sender,

@@ -3,14 +3,17 @@
 import { useQuery } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
 
+import { SuiAmount } from '~/components/Table/SuiAmount';
 import { TableFooter } from '~/components/Table/TableFooter';
-import { SuiAmount, TxTableCol } from '~/components/transactions/TxCardUtils';
+import { TxTableCol } from '~/components/transactions/TxCardUtils';
 import { TxTimeType } from '~/components/tx-time/TxTimeType';
 import { useEnhancedRpcClient } from '~/hooks/useEnhancedRpc';
 import { CheckpointSequenceLink, EpochLink } from '~/ui/InternalLink';
 import { usePaginationStack } from '~/ui/Pagination';
 import { PlaceholderTable } from '~/ui/PlaceholderTable';
 import { TableCard } from '~/ui/TableCard';
+import { Text } from '~/ui/Text';
+import { getEpochStorageFundFlow } from '~/utils/getStorageFundFlow';
 
 interface EpochsTableProps {
     initialLimit: number;
@@ -21,7 +24,6 @@ interface EpochsTableProps {
 export function EpochsTable({
     initialLimit,
     disablePagination,
-    refetchInterval,
 }: EpochsTableProps) {
     const enhancedRpc = useEnhancedRpcClient();
     const [limit, setLimit] = useState(initialLimit);
@@ -40,15 +42,15 @@ export function EpochsTable({
         ['epochs', { limit, cursor: pagination.cursor }],
         async () =>
             enhancedRpc.getEpochs({
-                limit: limit.toString(),
+                limit,
                 cursor: pagination.cursor?.toString(),
                 descendingOrder: true,
             }),
         {
             keepPreviousData: true,
+            retry: 5,
             // Disable refetching if not on the first page:
             // refetchInterval: pagination.cursor ? undefined : refetchInterval,
-            retry: false,
             staleTime: Infinity,
             cacheTime: 24 * 60 * 60 * 1000,
         }
@@ -66,7 +68,9 @@ export function EpochsTable({
                           ),
                           transactions: (
                               <TxTableCol>
-                                  {epoch.epochTotalTransactions}
+                                  <Text variant="bodySmall/medium">
+                                      {epoch.epochTotalTransactions}
+                                  </Text>
                               </TxTableCol>
                           ),
                           stakeRewards: (
@@ -93,9 +97,15 @@ export function EpochsTable({
                                   />
                               </div>
                           ),
-                          storageRevenue: (
+                          storageFundInflow: (
                               <TxTableCol>
-                                  {epoch.endOfEpochInfo?.storageCharge}
+                                  <SuiAmount
+                                      amount={
+                                          getEpochStorageFundFlow(
+                                              epoch.endOfEpochInfo
+                                          ).netInflow
+                                      }
+                                  />
                               </TxTableCol>
                           ),
                           time: (
@@ -127,8 +137,8 @@ export function EpochsTable({
                               accessorKey: 'checkpointSet',
                           },
                           {
-                              header: 'Storage Revenue',
-                              accessorKey: 'storageRevenue',
+                              header: 'Storage Net Inflow',
+                              accessorKey: 'storageFundInflow',
                           },
                           {
                               header: 'Epoch End',
@@ -160,7 +170,7 @@ export function EpochsTable({
                         'Transaction Blocks',
                         'Stake Rewards',
                         'Checkpoint Set',
-                        'Storage Revenue',
+                        'Net Inflow',
                         'Epoch End',
                     ]}
                     colWidths={[

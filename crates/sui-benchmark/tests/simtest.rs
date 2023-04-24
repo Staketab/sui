@@ -3,7 +3,6 @@
 
 #[cfg(msim)]
 mod test {
-
     use move_core_types::language_storage::StructTag;
     use rand::{distributions::uniform::SampleRange, thread_rng, Rng};
     use std::path::PathBuf;
@@ -93,7 +92,6 @@ mod test {
         test_simulated_load(TestInitData::new(&test_cluster).await, 120).await;
     }
 
-    #[ignore = "MUSTFIX"]
     #[sim_test(config = "test_config()")]
     async fn test_simulated_load_reconfig_restarts() {
         sui_protocol_config::ProtocolConfig::poison_get_for_min_version();
@@ -276,11 +274,13 @@ mod test {
                 SupportedProtocolVersions::new_for_testing(min_ver, max_ver),
             )
             .with_objects(init_framework.into_iter().map(|p| p.genesis_object()))
+            .with_stake_subsidy_start_epoch(10)
             .build()
             .await
             .unwrap();
 
         let test_init_data = TestInitData::new(&test_cluster).await;
+        let test_init_data_clone = test_init_data.clone();
 
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = finished.clone();
@@ -292,6 +292,14 @@ mod test {
                 // Let all nodes run for a bit at this version.
                 tokio::time::sleep(Duration::from_secs(50)).await;
                 if version == max_ver {
+                    let stake_subsidy_start_epoch = test_cluster
+                        .sui_client()
+                        .governance_api()
+                        .get_latest_sui_system_state()
+                        .await
+                        .unwrap()
+                        .stake_subsidy_start_epoch;
+                    assert_eq!(stake_subsidy_start_epoch, 20);
                     break;
                 }
                 let next_version = version + 1;
@@ -312,15 +320,15 @@ mod test {
                 }
                 info!("Framework injected");
                 test_cluster
-                    .upgrade_protocol(SupportedProtocolVersions::new_for_testing(
-                        min_ver,
-                        next_version,
-                    ))
+                    .update_validator_supported_versions(
+                        SupportedProtocolVersions::new_for_testing(min_ver, next_version),
+                    )
                     .await;
             }
             finished_clone.store(true, Ordering::SeqCst);
         });
-        test_simulated_load(test_init_data.clone(), 120).await;
+
+        test_simulated_load(test_init_data_clone, 120).await;
         loop {
             if finished.load(Ordering::Relaxed) {
                 break;
@@ -361,8 +369,8 @@ mod test {
     struct TestInitData {
         keystore_path: PathBuf,
         genesis: Genesis,
-        all_gas: Vec<(StructTag, ObjectRef)>,
-        sender: SuiAddress,
+        pub all_gas: Vec<(StructTag, ObjectRef)>,
+        pub sender: SuiAddress,
     }
 
     impl TestInitData {
@@ -389,15 +397,13 @@ mod test {
         let ed25519_keypair =
             Arc::new(get_ed25519_keypair_from_keystore(keystore_path, &sender).unwrap());
         let (_, gas) = all_gas.get(0).unwrap();
-        let (_move_struct, pay_coin) = all_gas.get(1).unwrap();
-        let primary_gas = (gas.clone(), sender, ed25519_keypair.clone());
-        let pay_coin = (pay_coin.clone(), sender, ed25519_keypair.clone());
+        let primary_coin = (gas.clone(), sender, ed25519_keypair.clone());
 
         let registry = prometheus::Registry::new();
         let proxy: Arc<dyn ValidatorProxy + Send + Sync> =
             Arc::new(LocalValidatorAggregatorProxy::from_genesis(&genesis, &registry, None).await);
 
-        let bank = BenchmarkBank::new(proxy.clone(), primary_gas, vec![pay_coin]);
+        let bank = BenchmarkBank::new(proxy.clone(), primary_coin);
         let system_state_observer = {
             let mut system_state_observer = SystemStateObserver::new(proxy.clone());
             if let Ok(_) = system_state_observer.state.changed().await {

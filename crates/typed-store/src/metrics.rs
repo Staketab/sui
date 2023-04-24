@@ -73,6 +73,7 @@ impl SamplingInterval {
 #[derive(Debug)]
 pub struct ColumnFamilyMetrics {
     pub rocksdb_total_sst_files_size: IntGaugeVec,
+    pub rocksdb_total_blob_files_size: IntGaugeVec,
     pub rocksdb_size_all_mem_tables: IntGaugeVec,
     pub rocksdb_num_snapshots: IntGaugeVec,
     pub rocksdb_oldest_snapshot_time: IntGaugeVec,
@@ -96,7 +97,14 @@ impl ColumnFamilyMetrics {
         ColumnFamilyMetrics {
             rocksdb_total_sst_files_size: register_int_gauge_vec_with_registry!(
                 "rocksdb_total_sst_files_size",
-                "The storage size occupied by the column family",
+                "The storage size occupied by the sst files in the column family",
+                &["cf_name"],
+                registry,
+            )
+            .unwrap(),
+            rocksdb_total_blob_files_size: register_int_gauge_vec_with_registry!(
+                "rocksdb_total_blob_files_size",
+                "The storage size occupied by the blob files in the column family",
                 &["cf_name"],
                 registry,
             )
@@ -807,9 +815,6 @@ pub struct DBMetrics {
     pub cf_metrics: ColumnFamilyMetrics,
     pub read_perf_ctx_metrics: ReadPerfContextMetrics,
     pub write_perf_ctx_metrics: WritePerfContextMetrics,
-    pub rocksdb_mem_table_usage: IntGaugeVec,
-    pub rocksdb_unflushed_mem_table_usage: IntGaugeVec,
-    pub rocksdb_table_readers_usage: IntGaugeVec,
 }
 
 static ONCE: OnceCell<Arc<DBMetrics>> = OnceCell::new();
@@ -821,27 +826,6 @@ impl DBMetrics {
             cf_metrics: ColumnFamilyMetrics::new(registry),
             read_perf_ctx_metrics: ReadPerfContextMetrics::new(registry),
             write_perf_ctx_metrics: WritePerfContextMetrics::new(registry),
-            rocksdb_mem_table_usage: register_int_gauge_vec_with_registry!(
-                "rocksdb_mem_table_usage",
-                "The estimated memory usage of the all memtables in the db",
-                &["db_name"],
-                registry,
-            )
-            .unwrap(),
-            rocksdb_unflushed_mem_table_usage: register_int_gauge_vec_with_registry!(
-                "rocksdb_unflushed_mem_table_usage",
-                "The estimated memory usage of unflushed memtables in the db",
-                &["db_name"],
-                registry,
-            )
-            .unwrap(),
-            rocksdb_table_readers_usage: register_int_gauge_vec_with_registry!(
-                "rocksdb_table_readers_usage",
-                "The estimated memory usage of all table readers",
-                &["db_name"],
-                registry,
-            )
-            .unwrap(),
         }
     }
     pub fn init(registry: &Registry) -> &'static Arc<DBMetrics> {

@@ -14,6 +14,7 @@ use serde_with::serde_as;
 use shared_crypto::intent::{Intent, IntentMessage, IntentScope};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
+use std::sync::Arc;
 use std::{fs, path::Path};
 use sui_adapter::adapter::MoveVM;
 use sui_adapter::{adapter, execution_mode, programmable_transactions};
@@ -43,6 +44,7 @@ use sui_types::messages::{
 use sui_types::messages_checkpoint::{
     CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary, VerifiedCheckpoint,
 };
+use sui_types::metrics::LimitsMetrics;
 use sui_types::multiaddr::Multiaddr;
 use sui_types::object::Owner;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
@@ -1259,18 +1261,23 @@ fn build_unsigned_genesis_data(
         token_distribution_schedule,
     );
 
+    // Use a throwaway metrics registry for genesis transaction execution.
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(LimitsMetrics::new(&registry));
+
     let objects = create_genesis_objects(
         &mut genesis_ctx,
         objects,
         &genesis_validators,
         &genesis_chain_parameters,
         token_distribution_schedule,
+        metrics.clone(),
     );
 
     let protocol_config = ProtocolConfig::get_for_version(parameters.protocol_version);
 
     let (genesis_transaction, genesis_effects, genesis_events, objects) =
-        create_genesis_transaction(objects, &protocol_config, &epoch_data);
+        create_genesis_transaction(objects, &protocol_config, metrics, &epoch_data);
     let (checkpoint, checkpoint_contents) =
         create_genesis_checkpoint(parameters, &genesis_transaction, &genesis_effects);
 
@@ -1313,6 +1320,7 @@ fn create_genesis_checkpoint(
 fn create_genesis_transaction(
     objects: Vec<Object>,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
     epoch_data: &EpochData,
 ) -> (
     Transaction,
@@ -1356,7 +1364,7 @@ fn create_genesis_transaction(
             protocol_config,
         );
 
-        let native_functions = sui_framework::natives::all_natives(/* silent */ true);
+        let native_functions = sui_move_natives::all_natives(/* silent */ true);
         let enable_move_vm_paranoid_checks = false;
         let move_vm = std::sync::Arc::new(
             adapter::new_move_vm(
@@ -1385,6 +1393,7 @@ fn create_genesis_transaction(
                 SuiGasStatus::new_unmetered(protocol_config),
                 epoch_data,
                 protocol_config,
+                metrics,
                 false, // enable_expensive_checks
             );
         assert!(inner_temp_store.objects.is_empty());
@@ -1411,12 +1420,13 @@ fn create_genesis_objects(
     validators: &[GenesisValidatorMetadata],
     parameters: &GenesisChainParameters,
     token_distribution_schedule: &TokenDistributionSchedule,
+    metrics: Arc<LimitsMetrics>,
 ) -> Vec<Object> {
     let mut store = InMemoryStorage::new(Vec::new());
     let protocol_config =
         ProtocolConfig::get_for_version(ProtocolVersion::new(parameters.protocol_version));
 
-    let native_functions = sui_framework::natives::all_natives(/* silent */ true);
+    let native_functions = sui_move_natives::all_natives(/* silent */ true);
     // paranoid checks are a last line of defense for malicious code, no need to run them in genesis
     let enable_move_vm_paranoid_checks = false;
     let move_vm = adapter::new_move_vm(
@@ -1434,6 +1444,7 @@ fn create_genesis_objects(
             &system_package.modules(),
             system_package.dependencies().to_vec(),
             &protocol_config,
+            metrics.clone(),
         )
         .unwrap();
     }
@@ -1449,6 +1460,7 @@ fn create_genesis_objects(
         genesis_ctx,
         parameters,
         token_distribution_schedule,
+        metrics,
     )
     .unwrap();
 
@@ -1462,6 +1474,7 @@ fn process_package(
     modules: &[CompiledModule],
     dependencies: Vec<ObjectID>,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
 ) -> Result<()> {
     let dependency_objects = store.get_objects(&dependencies);
     // When publishing genesis packages, since the std framework packages all have
@@ -1519,6 +1532,7 @@ fn process_package(
     };
     programmable_transactions::execution::execute::<_, execution_mode::Genesis>(
         protocol_config,
+        metrics,
         vm,
         &mut temporary_store,
         ctx,
@@ -1543,6 +1557,7 @@ pub fn generate_genesis_system_object(
     genesis_ctx: &mut TxContext,
     genesis_chain_parameters: &GenesisChainParameters,
     token_distribution_schedule: &TokenDistributionSchedule,
+    metrics: Arc<LimitsMetrics>,
 ) -> Result<()> {
     let genesis_digest = genesis_ctx.digest();
     let protocol_config = ProtocolConfig::get_for_version(ProtocolVersion::new(
@@ -1608,6 +1623,7 @@ pub fn generate_genesis_system_object(
     };
     programmable_transactions::execution::execute::<_, execution_mode::Genesis>(
         &protocol_config,
+        metrics,
         move_vm,
         &mut temporary_store,
         genesis_ctx,
@@ -1900,12 +1916,11 @@ mod test {
 
     #[test]
     fn genesis_transaction() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let builder = crate::builder::ConfigBuilder::new(&dir);
-        let protocol_version = builder.protocol_version;
-        let protocol_config = ProtocolConfig::get_for_version(protocol_version);
+        let builder = crate::builder::ConfigBuilder::new_with_temp_dir();
         let network_config = builder.build();
         let genesis = network_config.genesis;
+        let protocol_version = ProtocolVersion::new(genesis.sui_system_object().protocol_version());
+        let protocol_config = ProtocolConfig::get_for_version(protocol_version);
 
         let genesis_transaction = genesis.transaction.clone();
 
@@ -1918,7 +1933,7 @@ mod test {
         );
 
         let enable_move_vm_paranoid_checks = false;
-        let native_functions = sui_framework::natives::all_natives(/* silent */ true);
+        let native_functions = sui_move_natives::all_natives(/* silent */ true);
         let move_vm = std::sync::Arc::new(
             adapter::new_move_vm(
                 native_functions,
@@ -1927,6 +1942,10 @@ mod test {
             )
             .expect("We defined natives to not fail here"),
         );
+
+        // Use a throwaway metrics registry for genesis transaction execution.
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(LimitsMetrics::new(&registry));
 
         let transaction_data = &genesis_transaction.data().intent_message().value;
         let (kind, signer, gas) = transaction_data.execution_parts();
@@ -1946,6 +1965,7 @@ mod test {
                 SuiGasStatus::new_unmetered(&protocol_config),
                 &EpochData::new_test(),
                 &protocol_config,
+                metrics,
                 false, // enable_expensive_checks
             );
 

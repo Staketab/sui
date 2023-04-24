@@ -46,7 +46,7 @@ Use `sui client -h` to see a list of supported commands.
 
 Use `sui help <command>` to see more information on each command.
 
-You can start the client in two modes: interactive shell or command line interface [Configure Sui client](../build/devnet.md#configure-sui-client).
+You can start the client in two modes: interactive shell or command line interface [Configure Sui client](../build/connect-sui-network.md#configure-sui-client).
 
 ### Interactive shell
 
@@ -290,7 +290,7 @@ sui client transfer --to 0xcd2630011f6cb9aef960ed42d95b04e063c44a6143083ef89a35e
 
 You can merge coins to reduce the number of separate coin objects in an account, or split coins to create smaller coin objects to use for transfers or gas payments.
 
-We can use the `merge-coin` command and `split-coin` command to consolidate or split coins, respectively.
+You can use the `merge-coin` command and `split-coin` command to consolidate or split coins, respectively.
 
 ### Merge coins
 
@@ -425,7 +425,7 @@ The command parameters include:
   * address of the new gas object owner
 * `--gas` - an optional object containing gas used to pay for this
   function call
-* `--gas-budget` - a decimal value expressing how much gas we are
+* `--gas-budget` - a decimal value expressing how much gas you are
   willing to pay for the `transfer` call to be completed to avoid
   accidental drain of all gas in the gas pay)
 

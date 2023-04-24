@@ -29,8 +29,6 @@ import { Tooltip } from '~/ui/Tooltip';
 import { getValidatorMoveEvent } from '~/utils/getValidatorMoveEvent';
 import { VALIDATOR_LOW_STAKE_GRACE_PERIOD } from '~/utils/validatorConstants';
 
-const APY_DECIMALS = 3;
-
 const NodeMap = lazy(() => import('../../components/node-map'));
 
 export function validatorsTableData(
@@ -136,7 +134,9 @@ export function validatorsTableData(
                 header: 'Proposed Next Epoch Gas Price',
                 accessorKey: 'nextEpochGasPrice',
                 enableSorting: true,
-                cell: (props: any) => <StakeColumn stake={props.getValue()} />,
+                cell: (props: any) => (
+                    <StakeColumn stake={props.getValue()} inMIST />
+                ),
             },
             {
                 header: 'APY',
@@ -243,9 +243,12 @@ function ValidatorPageResult() {
             Object.keys(rollingAverageApys)?.length === 0
         )
             return null;
-        const apys = Object.values(rollingAverageApys);
+
+        // exclude validators with no apy
+        const apys = Object.values(rollingAverageApys)?.filter((a) => a > 0);
         const averageAPY = apys?.reduce((acc, cur) => acc + cur, 0);
-        return roundFloat(averageAPY / apys.length, APY_DECIMALS);
+        // in case of no apy, return 0
+        return apys.length > 0 ? roundFloat(averageAPY / apys.length) : 0;
     }, [rollingAverageApys]);
 
     const lastEpochRewardOnAllValidators = useMemo(() => {
@@ -299,7 +302,7 @@ function ValidatorPageResult() {
                                 />
 
                                 <Stats
-                                    label="Last Epoch SUI Rewards"
+                                    label="Last Epoch Rewards"
                                     tooltip="The stake rewards collected during the last epoch."
                                     unavailable={
                                         lastEpochRewardOnAllValidators <= 0

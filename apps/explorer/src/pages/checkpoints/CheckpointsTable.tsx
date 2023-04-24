@@ -26,7 +26,6 @@ export function CheckpointsTable({
     initialCursor,
     maxCursor,
     disablePagination,
-    refetchInterval,
 }: CheckpointsTableProps) {
     const rpc = useRpcClient();
     const [limit, setLimit] = useState(initialLimit);
@@ -50,12 +49,12 @@ export function CheckpointsTable({
         ['checkpoints', { limit, cursor }],
         () =>
             rpc.getCheckpoints({
-                limit: (cursor &&
-                maxCursor &&
-                Number(cursor) - Number(limit) < Number(maxCursor)
-                    ? Number(cursor) - Number(maxCursor)
-                    : limit
-                ).toString(),
+                limit:
+                    cursor &&
+                    maxCursor &&
+                    Number(cursor) - limit < Number(maxCursor)
+                        ? Number(cursor) - Number(maxCursor)
+                        : limit,
                 descendingOrder: true,
                 cursor,
             }),

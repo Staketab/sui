@@ -4,6 +4,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::execution_mode::{self, ExecutionMode};
+use move_binary_format::access::ModuleAccess;
 use move_binary_format::CompiledModule;
 use move_bytecode_utils::module_cache::GetModule;
 use move_vm_runtime::move_vm::MoveVM;
@@ -13,6 +14,8 @@ use sui_types::balance::{
 };
 use sui_types::base_types::ObjectID;
 use sui_types::gas_coin::GAS;
+use sui_types::metrics::LimitsMetrics;
+use sui_types::object::OBJECT_START_VERSION;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use tracing::{info, instrument, trace, warn};
 
@@ -20,16 +23,20 @@ use crate::programmable_transactions;
 use sui_macros::checked_arithmetic;
 use sui_protocol_config::{check_limit_by_meter, LimitThresholdCrossed, ProtocolConfig};
 use sui_types::clock::{CLOCK_MODULE_NAME, CONSENSUS_COMMIT_PROLOGUE_FUNCTION_NAME};
+use sui_types::committee::EpochId;
 use sui_types::epoch_data::EpochData;
 use sui_types::error::{ExecutionError, ExecutionErrorKind};
 use sui_types::gas::{GasCostSummary, SuiGasStatusAPI};
 use sui_types::messages::{
-    Argument, ConsensusCommitPrologue, GenesisTransaction, ObjectArg, ProgrammableTransaction,
-    TransactionKind,
+    Argument, Command, ConsensusCommitPrologue, GenesisTransaction, ObjectArg,
+    ProgrammableTransaction, TransactionKind,
 };
 use sui_types::storage::{ChildObjectResolver, ObjectStore, ParentSync, WriteKind};
+#[cfg(msim)]
+use sui_types::sui_system_state::advance_epoch_result_injection::maybe_modify_result;
 use sui_types::sui_system_state::{AdvanceEpochParams, ADVANCE_EPOCH_SAFE_MODE_FUNCTION_NAME};
 use sui_types::temporary_store::InnerTemporaryStore;
+use sui_types::temporary_store::TemporaryStore;
 use sui_types::{
     base_types::{ObjectRef, SuiAddress, TransactionDigest, TxContext},
     gas::SuiGasStatus,
@@ -41,18 +48,55 @@ use sui_types::{
 };
 use sui_types::{
     is_system_package, SUI_CLOCK_OBJECT_ID, SUI_CLOCK_OBJECT_SHARED_VERSION,
-    SUI_FRAMEWORK_OBJECT_ID, SUI_SYSTEM_PACKAGE_ID, SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
+    SUI_FRAMEWORK_OBJECT_ID, SUI_SYSTEM_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
 };
-
-use sui_types::temporary_store::TemporaryStore;
-
-#[cfg(msim)]
-use self::advance_epoch_result_injection::maybe_modify_result;
 
 checked_arithmetic! {
 
 #[instrument(name = "tx_execute_to_effects", level = "debug", skip_all)]
 pub fn execute_transaction_to_effects<
+    Mode: ExecutionMode,
+    S: BackingPackageStore + ParentSync + ChildObjectResolver + ObjectStore + GetModule,
+>(
+    shared_object_refs: Vec<ObjectRef>,
+    temporary_store: TemporaryStore<S>,
+    transaction_kind: TransactionKind,
+    transaction_signer: SuiAddress,
+    gas: &[ObjectRef],
+    transaction_digest: TransactionDigest,
+    transaction_dependencies: BTreeSet<TransactionDigest>,
+    move_vm: &Arc<MoveVM>,
+    gas_status: SuiGasStatus,
+    epoch_data: &EpochData,
+    protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
+    enable_expensive_checks: bool
+) -> (
+    InnerTemporaryStore,
+    TransactionEffects,
+    Result<Mode::ExecutionResults, ExecutionError>,
+) {
+    // Separating out impl so we can call this from other context
+    execute_transaction_to_effects_impl::<Mode, S>(
+        shared_object_refs,
+        temporary_store,
+        transaction_kind,
+        transaction_signer,
+        gas,
+        transaction_digest,
+        transaction_dependencies,
+        move_vm,
+        gas_status,
+        &epoch_data.epoch_id(),
+        epoch_data.epoch_start_timestamp(),
+        protocol_config,
+        metrics,
+        enable_expensive_checks
+    )
+}
+
+/// Separating out impl so we can call this from other context
+pub fn execute_transaction_to_effects_impl<
     Mode: ExecutionMode,
     S: BackingPackageStore + ParentSync + ChildObjectResolver + ObjectStore + GetModule,
 >(
@@ -65,15 +109,17 @@ pub fn execute_transaction_to_effects<
     mut transaction_dependencies: BTreeSet<TransactionDigest>,
     move_vm: &Arc<MoveVM>,
     gas_status: SuiGasStatus,
-    epoch_data: &EpochData,
+    epoch_id: &EpochId,
+    epoch_timestamp_ms: u64,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
     enable_expensive_checks: bool
 ) -> (
     InnerTemporaryStore,
     TransactionEffects,
     Result<Mode::ExecutionResults, ExecutionError>,
 ) {
-    let mut tx_ctx = TxContext::new(&transaction_signer, &transaction_digest, epoch_data);
+    let mut tx_ctx = TxContext::new_from_components(&transaction_signer, &transaction_digest, epoch_id, epoch_timestamp_ms);
 
     #[cfg(debug_assertions)]
     let is_epoch_change = matches!(transaction_kind, TransactionKind::ChangeEpoch(_));
@@ -86,6 +132,7 @@ pub fn execute_transaction_to_effects<
         move_vm,
         gas_status,
         protocol_config,
+        metrics,
         enable_expensive_checks
     );
 
@@ -163,7 +210,7 @@ pub fn execute_transaction_to_effects<
         gas_cost_summary,
         status,
         gas,
-        epoch_data.epoch_id(),
+        *epoch_id,
     );
     (inner, effects, execution_result)
 }
@@ -195,6 +242,7 @@ fn execute_transaction<
     move_vm: &Arc<MoveVM>,
     mut gas_status: SuiGasStatus,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
     enable_expensive_checks: bool
 ) -> (
     GasCostSummary,
@@ -227,6 +275,7 @@ fn execute_transaction<
             move_vm,
             &mut gas_status,
             protocol_config,
+            metrics.clone(),
         );
 
         let effects_estimated_size = temporary_store.estimate_effects_size_upperbound();
@@ -238,11 +287,11 @@ fn execute_transaction<
             !gas_status.is_unmetered(),
             effects_estimated_size,
             protocol_config.max_serialized_tx_effects_size_bytes(),
-            protocol_config.max_serialized_tx_effects_size_bytes_system_tx()
+            protocol_config.max_serialized_tx_effects_size_bytes_system_tx(),
+            metrics.excessive_estimated_effects_size
         ) {
             LimitThresholdCrossed::None => (),
             LimitThresholdCrossed::Soft(_, limit) => {
-                /* TODO: add more alerting */
                 warn!(
                     effects_estimated_size = effects_estimated_size,
                     soft_limit = limit,
@@ -271,11 +320,11 @@ fn execute_transaction<
                     !gas_status.is_unmetered(),
                     written_objects_size,
                     normal_lim,
-                    system_lim
+                    system_lim,
+                    metrics.excessive_written_objects_size
                 ) {
                     LimitThresholdCrossed::None => (),
                     LimitThresholdCrossed::Soft(_, limit) => {
-                        /* TODO: add more alerting */
                         warn!(
                             written_objects_size = written_objects_size,
                             soft_limit = limit,
@@ -362,6 +411,7 @@ fn execution_loop<
     move_vm: &Arc<MoveVM>,
     gas_status: &mut SuiGasStatus,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
 ) -> Result<Mode::ExecutionResults, ExecutionError> {
     match transaction_kind {
         TransactionKind::ChangeEpoch(change_epoch) => {
@@ -372,6 +422,7 @@ fn execution_loop<
                 move_vm,
                 gas_status,
                 protocol_config,
+                metrics,
             )?;
             Ok(Mode::empty_results())
         }
@@ -403,12 +454,14 @@ fn execution_loop<
                 move_vm,
                 gas_status,
                 protocol_config,
+                metrics,
             ).expect("ConsensusCommitPrologue cannot fail");
             Ok(Mode::empty_results())
         }
         TransactionKind::ProgrammableTransaction(pt) => {
             programmable_transactions::execution::execute::<_, Mode>(
                 protocol_config,
+                metrics,
                 move_vm,
                 temporary_store,
                 tx_ctx,
@@ -495,7 +548,7 @@ pub fn construct_advance_epoch_pt(
     );
 
     let storage_rebates = builder.programmable_move_call(
-        SUI_SYSTEM_PACKAGE_ID,
+        SUI_SYSTEM_OBJECT_ID,
         SUI_SYSTEM_MODULE_NAME.to_owned(),
         ADVANCE_EPOCH_FUNCTION_NAME.to_owned(),
         vec![],
@@ -561,7 +614,7 @@ pub fn construct_advance_epoch_safe_mode_pt(
     );
 
     builder.programmable_move_call(
-        SUI_SYSTEM_PACKAGE_ID,
+        SUI_SYSTEM_OBJECT_ID,
         SUI_SYSTEM_MODULE_NAME.to_owned(),
         ADVANCE_EPOCH_SAFE_MODE_FUNCTION_NAME.to_owned(),
         vec![],
@@ -578,6 +631,7 @@ fn advance_epoch<S: ObjectStore + BackingPackageStore + ParentSync + ChildObject
     move_vm: &Arc<MoveVM>,
     gas_status: &mut SuiGasStatus,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
 ) -> Result<(), ExecutionError> {
     let params = AdvanceEpochParams {
         epoch: change_epoch.epoch,
@@ -593,6 +647,7 @@ fn advance_epoch<S: ObjectStore + BackingPackageStore + ParentSync + ChildObject
     let advance_epoch_pt = construct_advance_epoch_pt(&params)?;
     let result = programmable_transactions::execution::execute::<_, execution_mode::System>(
         protocol_config,
+        metrics.clone(),
         move_vm,
         temporary_store,
         tx_ctx,
@@ -622,6 +677,7 @@ fn advance_epoch<S: ObjectStore + BackingPackageStore + ParentSync + ChildObject
                 construct_advance_epoch_safe_mode_pt(&params, protocol_config)?;
             programmable_transactions::execution::execute::<_, execution_mode::System>(
                 protocol_config,
+                metrics.clone(),
                 move_vm,
                 temporary_store,
                 tx_ctx,
@@ -634,33 +690,54 @@ fn advance_epoch<S: ObjectStore + BackingPackageStore + ParentSync + ChildObject
     }
 
     for (version, modules, dependencies) in change_epoch.system_packages.into_iter() {
-        let modules: Vec<_> = modules
-            .into_iter()
-            .map(|m| {
-                CompiledModule::deserialize_with_max_version(
-                    &m,
-                    protocol_config.move_binary_format_version(),
-                )
-                .unwrap()
-            })
+        let max_format_version = protocol_config.move_binary_format_version();
+        let deserialized_modules: Vec<_> = modules
+            .iter()
+            .map(|m| CompiledModule::deserialize_with_max_version(m, max_format_version).unwrap())
             .collect();
 
-        let mut new_package =
-            Object::new_system_package(&modules, version, dependencies, tx_ctx.digest());
+        if version == OBJECT_START_VERSION {
+            let package_id = deserialized_modules.first().unwrap().address();
+            info!("adding new system package {package_id}");
 
-        info!(
-            "upgraded system package {:?}",
-            new_package.compute_object_reference()
-        );
+            let publish_pt = {
+                let mut b = ProgrammableTransactionBuilder::new();
+                b.command(Command::Publish(modules, dependencies));
+                b.finish()
+            };
 
-        // Decrement the version before writing the package so that the store can record the version
-        // growing by one in the effects.
-        new_package
-            .data
-            .try_as_package_mut()
-            .unwrap()
-            .decrement_version();
-        temporary_store.write_object(new_package, WriteKind::Mutate);
+            programmable_transactions::execution::execute::<_, execution_mode::System>(
+                protocol_config,
+                metrics.clone(),
+                move_vm,
+                temporary_store,
+                tx_ctx,
+                gas_status,
+                None,
+                publish_pt,
+            )
+            .expect("System Package Publish must succeed");
+        } else {
+            let mut new_package = Object::new_system_package(
+                &deserialized_modules, version, dependencies, tx_ctx.digest(),
+            );
+
+            info!(
+                "upgraded system package {:?}",
+                new_package.compute_object_reference()
+            );
+
+            // Decrement the version before writing the package so that the store can record the
+            // version growing by one in the effects.
+            new_package
+                .data
+                .try_as_package_mut()
+                .unwrap()
+                .decrement_version();
+
+            // upgrade of a previously existing framework module
+            temporary_store.write_object(new_package, WriteKind::Mutate);
+        }
     }
 
     Ok(())
@@ -677,6 +754,7 @@ fn setup_consensus_commit<S: BackingPackageStore + ParentSync + ChildObjectResol
     move_vm: &Arc<MoveVM>,
     gas_status: &mut SuiGasStatus,
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
 ) -> Result<(), ExecutionError> {
     let pt = {
         let mut builder = ProgrammableTransactionBuilder::new();
@@ -702,6 +780,7 @@ fn setup_consensus_commit<S: BackingPackageStore + ParentSync + ChildObjectResol
     };
     programmable_transactions::execution::execute::<_, execution_mode::System>(
         protocol_config,
+        metrics,
         move_vm,
         temporary_store,
         tx_ctx,
@@ -711,31 +790,4 @@ fn setup_consensus_commit<S: BackingPackageStore + ParentSync + ChildObjectResol
     )
 }
 
-}
-
-#[cfg(msim)]
-pub mod advance_epoch_result_injection {
-    use std::cell::RefCell;
-    use sui_types::error::{ExecutionError, ExecutionErrorKind};
-
-    thread_local! {
-        static OVERRIDE: RefCell<bool>  = RefCell::new(false);
-    }
-
-    pub fn set_override(value: bool) {
-        OVERRIDE.with(|o| *o.borrow_mut() = value);
-    }
-
-    /// This function is used to modify the result of advance_epoch transaction for testing.
-    /// If the override is set, the result will be an execution error, otherwise the original result will be returned.
-    pub fn maybe_modify_result(result: Result<(), ExecutionError>) -> Result<(), ExecutionError> {
-        if OVERRIDE.with(|o| *o.borrow()) {
-            Err::<(), ExecutionError>(ExecutionError::new(
-                ExecutionErrorKind::FunctionNotFound,
-                None,
-            ))
-        } else {
-            result
-        }
-    }
 }

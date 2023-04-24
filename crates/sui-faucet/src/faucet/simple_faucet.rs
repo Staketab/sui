@@ -41,7 +41,7 @@ pub struct SimpleFaucet {
     active_address: SuiAddress,
     producer: Mutex<Sender<ObjectID>>,
     consumer: Mutex<Receiver<ObjectID>>,
-    metrics: FaucetMetrics,
+    pub metrics: FaucetMetrics,
     wal: Mutex<WriteAheadLog>,
 }
 
@@ -245,18 +245,11 @@ impl SimpleFaucet {
         // Drops the lock early because sign_and_execute_txn requires the lock.
         drop(wal);
 
-        let transfer_results =
-            futures::future::join_all(pending.into_iter().map(|(uuid, recipient, coin_id, tx)| {
-                self.sign_and_execute_txn(uuid, recipient, coin_id, tx)
-            }))
-            .await;
+        futures::future::join_all(pending.into_iter().map(|(uuid, recipient, coin_id, tx)| {
+            self.sign_and_execute_txn(uuid, recipient, coin_id, tx)
+        }))
+        .await;
 
-        for result in transfer_results.into_iter() {
-            if result.is_ok() {
-                self.metrics.total_available_coins.inc();
-                self.metrics.total_discarded_coins.dec();
-            }
-        }
         Ok(())
     }
 
@@ -737,6 +730,7 @@ mod tests {
             input_coins: vec![*bad_gas.id()],
             recipient: SuiAddress::random_for_testing_only(),
             gas_budget: 2_000_000,
+            serialize_output: false,
         }
         .execute(faucet.wallet_mut())
         .await
@@ -794,6 +788,9 @@ mod tests {
         .await
         .unwrap();
 
+        let original_available = faucet.metrics.total_available_coins.get();
+        let original_discarded = faucet.metrics.total_discarded_coins.get();
+
         let recipient = SuiAddress::random_for_testing_only();
         let faucet_address = faucet.wallet_mut().active_address().unwrap();
         let uuid = Uuid::new_v4();
@@ -826,6 +823,10 @@ mod tests {
 
         let wal_2 = faucet.wal.lock().await;
         assert!(wal_2.log.is_empty());
+        let total_coins = faucet.metrics.total_available_coins.get();
+        let discarded_coins = faucet.metrics.total_discarded_coins.get();
+        assert_eq!(total_coins, original_available);
+        assert_eq!(discarded_coins, original_discarded);
     }
 
     #[tokio::test]
@@ -846,6 +847,7 @@ mod tests {
             gas_budget: 50000000,
             gas: None,
             count: None,
+            serialize_output: false,
         }
         .execute(&mut context)
         .await;

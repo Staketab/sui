@@ -4,6 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::Arc,
 };
 
 use move_binary_format::{
@@ -24,21 +25,23 @@ use move_vm_runtime::{
 };
 use move_vm_types::loaded_data::runtime_types::{StructType, Type};
 use serde::{de::DeserializeSeed, Deserialize};
+use sui_move_natives::object_runtime::ObjectRuntime;
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
     base_types::{
-        MoveObjectType, ObjectID, SuiAddress, TxContext, TX_CONTEXT_MODULE_NAME,
-        TX_CONTEXT_STRUCT_NAME,
+        MoveObjectType, ObjectID, SuiAddress, TxContext, TxContextKind, RESOLVED_ASCII_STR,
+        RESOLVED_STD_OPTION, RESOLVED_UTF8_STR, TX_CONTEXT_MODULE_NAME, TX_CONTEXT_STRUCT_NAME,
     },
     coin::Coin,
     error::{ExecutionError, ExecutionErrorKind},
     event::Event,
     gas::{SuiGasStatus, SuiGasStatusAPI},
-    id::UID,
+    id::{RESOLVED_SUI_ID, UID},
     messages::{
         Argument, Command, CommandArgumentError, PackageUpgradeError, ProgrammableMoveCall,
         ProgrammableTransaction,
     },
+    metrics::LimitsMetrics,
     move_package::{
         normalize_deserialized_modules, MovePackage, UpgradeCap, UpgradePolicy, UpgradeReceipt,
         UpgradeTicket,
@@ -46,9 +49,6 @@ use sui_types::{
     SUI_FRAMEWORK_ADDRESS,
 };
 use sui_verifier::{
-    entry_points_verifier::{
-        TxContextKind, RESOLVED_ASCII_STR, RESOLVED_STD_OPTION, RESOLVED_SUI_ID, RESOLVED_UTF8_STR,
-    },
     private_generics::{EVENT_MODULE, PRIVATE_TRANSFER_FUNCTIONS, TRANSFER_MODULE},
     INIT_FN_NAME,
 };
@@ -61,6 +61,7 @@ sui_macros::checked_arithmetic! {
 
 pub fn execute<S: StorageView, Mode: ExecutionMode>(
     protocol_config: &ProtocolConfig,
+    metrics: Arc<LimitsMetrics>,
     vm: &MoveVM,
     state_view: &mut S,
     tx_context: &mut TxContext,
@@ -71,6 +72,7 @@ pub fn execute<S: StorageView, Mode: ExecutionMode>(
     let ProgrammableTransaction { inputs, commands } = pt;
     let mut context = ExecutionContext::new(
         protocol_config,
+        metrics,
         vm,
         state_view,
         tx_context,
@@ -81,14 +83,30 @@ pub fn execute<S: StorageView, Mode: ExecutionMode>(
     // execute commands
     let mut mode_results = Mode::empty_results();
     for (idx, command) in commands.into_iter().enumerate() {
-        execute_command::<_, Mode>(&mut context, &mut mode_results, command)
-            .map_err(|e| e.with_command_index(idx))?
+        if let Err(err) = execute_command::<_, Mode>(&mut context, &mut mode_results, command) {
+                let object_runtime: &ObjectRuntime = context.session.get_native_extensions().get();
+                // We still need to record the loaded child objects for replay
+                let loaded_child_objects = object_runtime.loaded_child_objects();
+                drop(context);
+                state_view.save_loaded_child_objects(loaded_child_objects);
+                return Err(err.with_command_index(idx));
+        };
     }
+
+    // Save loaded objects table in case we fail in post execution
+    let object_runtime: &ObjectRuntime = context.session.get_native_extensions().get();
+    // We still need to record the loaded child objects for replay
+    let loaded_child_objects = object_runtime.loaded_child_objects();
+
     // apply changes
+    let finished  = context.finish::<Mode>();
+    // Save loaded objects for debug. We dont want to lose the info
+    state_view.save_loaded_child_objects(loaded_child_objects);
+
     let ExecutionResults {
         object_changes,
         user_events,
-    } = context.finish::<Mode>()?;
+    } =  finished?;
     state_view.apply_object_changes(object_changes);
     for (module_id, tag, contents) in user_events {
         state_view.log_event(Event::new(
@@ -116,7 +134,8 @@ fn execute_command<S: StorageView, Mode: ExecutionMode>(
                     "input checker ensures if args are empty, there is a type specified"
                 );
             };
-            let elem_ty = context.load_type(&tag)
+            let elem_ty = context
+                .load_type(&tag)
                 .map_err(|e| context.convert_vm_error(e))?;
             let ty = Type::Vector(Box::new(elem_ty));
             let abilities = context
@@ -140,7 +159,8 @@ fn execute_command<S: StorageView, Mode: ExecutionMode>(
             let mut arg_iter = args.into_iter().enumerate();
             let (mut used_in_non_entry_move_call, elem_ty) = match tag_opt {
                 Some(tag) => {
-                    let elem_ty = context.load_type(&tag)
+                    let elem_ty = context
+                        .load_type(&tag)
                         .map_err(|e| context.convert_vm_error(e))?;
                     (false, elem_ty)
                 }
@@ -268,7 +288,8 @@ fn execute_command<S: StorageView, Mode: ExecutionMode>(
             // Convert type arguments to `Type`s
             let mut loaded_type_arguments = Vec::with_capacity(type_arguments.len());
             for (ix, type_arg) in type_arguments.into_iter().enumerate() {
-                let ty = context.load_type(&type_arg)
+                let ty = context
+                    .load_type(&type_arg)
                     .map_err(|e| context.convert_type_argument_error(ix, e))?;
                 loaded_type_arguments.push(ty);
             }
@@ -364,7 +385,9 @@ fn execute_move_call<S: StorageView, Mode: ExecutionMode>(
         argument_updates,
         &arguments,
         used_in_non_entry_move_call,
-        mutable_reference_outputs.into_iter().map(|(i, bytes, _layout)| (i, bytes)),
+        mutable_reference_outputs
+            .into_iter()
+            .map(|(i, bytes, _layout)| (i, bytes)),
         by_mut_ref,
         return_values.into_iter().map(|(bytes, _layout)| bytes),
         return_value_kinds,
@@ -396,7 +419,9 @@ fn write_back_results<S: StorageView, Mode: ExecutionMode>(
         .zip(return_value_kinds)
         .map(|(bytes, kind)| {
             // only non entry functions have return values
-            make_value(context, kind, bytes, /* used_in_non_entry_move_call */ true)
+            make_value(
+                context, kind, bytes, /* used_in_non_entry_move_call */ true,
+            )
         })
         .collect()
 }
@@ -474,9 +499,8 @@ fn execute_move_publish<S: StorageView, Mode: ExecutionMode>(
         };
 
         context.set_linkage(package)?;
-        let res = publish_and_verify_modules(context, runtime_id, &modules).and_then(|_| {
-            init_modules::<_, Mode>(context, argument_updates, &modules)
-        });
+        let res = publish_and_verify_modules(context, runtime_id, &modules)
+            .and_then(|_| init_modules::<_, Mode>(context, argument_updates, &modules));
         context.reset_linkage();
         res?;
 
@@ -490,7 +514,6 @@ fn execute_move_publish<S: StorageView, Mode: ExecutionMode>(
         init_modules::<_, Mode>(context, argument_updates, &modules)?;
         package
     };
-
 
     context.write_package(package_obj)?;
     let values = if Mode::packages_are_predefined() {
@@ -529,12 +552,12 @@ fn execute_move_upgrade<S: StorageView, Mode: ExecutionMode>(
         "empty package is checked in transaction input checker"
     );
 
-    let upgrade_ticket_type =
-        context.load_type(&TypeTag::Struct(Box::new(UpgradeTicket::type_())))
-            .map_err(|e| context.convert_vm_error(e))?;
-    let upgrade_receipt_type =
-        context.load_type(&TypeTag::Struct(Box::new(UpgradeReceipt::type_())))
-            .map_err(|e| context.convert_vm_error(e))?;
+    let upgrade_ticket_type = context
+        .load_type(&TypeTag::Struct(Box::new(UpgradeTicket::type_())))
+        .map_err(|e| context.convert_vm_error(e))?;
+    let upgrade_receipt_type = context
+        .load_type(&TypeTag::Struct(Box::new(UpgradeReceipt::type_())))
+        .map_err(|e| context.convert_vm_error(e))?;
 
     let upgrade_ticket: UpgradeTicket = {
         let mut ticket_bytes = Vec::new();
@@ -642,7 +665,7 @@ fn check_compatibility<'a, S: StorageView>(
             ));
         };
 
-        if let Err(e) = policy.check_compatibility(&cur_module, &new_module) {
+        if let Err(e) = policy.check_compatibility(&cur_module, &new_module, context.protocol_config) {
             return Err(ExecutionError::new_with_source(
                 ExecutionErrorKind::PackageUpgradeError {
                     upgrade_error: PackageUpgradeError::IncompatibleUpgrade,
@@ -738,8 +761,14 @@ fn vm_move_call<S: StorageView>(
     // Move VM (e.g. to account for the number of created
     // objects).
     if tx_context_kind == TxContextKind::Mutable {
-        let (_, ctx_bytes, _) = result.mutable_reference_outputs.pop().unwrap();
-        let updated_ctx: TxContext = bcs::from_bytes(&ctx_bytes).unwrap();
+        let Some((_, ctx_bytes, _)) = result.mutable_reference_outputs.pop() else {
+            invariant_violation!("Missing TxContext in reference outputs");
+        };
+        let updated_ctx: TxContext = bcs::from_bytes(&ctx_bytes).map_err(|e| {
+            ExecutionError::invariant_violation(format!(
+                "Unable to deserialize TxContext bytes. {e}"
+            ))
+        })?;
         context.tx_context.update_state(updated_ctx)?;
     }
     Ok(result)

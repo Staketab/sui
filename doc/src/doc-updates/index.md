@@ -4,13 +4,19 @@ title: Sui Documentation Updates
 
 This topic lists the significant updates to the [Sui documentation](https://docs.sui.io) site so that you can easily identify new or updated information.
 
+## Week ending 04/22/23
+
+| Topic | Update | 
+| :------ | :------- |
+| [Sui Full Node](../build/fullnode.md#hardware-requirements). | Updated hardware requirements. |
+
 ## Week ending 03/25/23
 
 | Topic | Update | 
 | :------ | :------- |
 | Numerous topics. | Updates to reflect the changes included in Sui releases .28 and .29. |
 | [Sui Local Network](../build/sui-local-network.md) | Updated installation instructions to include the sui-test-validator, which lets you use a local faucet, wallet, and explorer on your local network. |
-| [Connect to a Sui Network](../build/devnet.md) | Updated the topic to include instructions for connecting to Sui Testnet. Topic title changed from "Connect to Sui Devnet". |
+| [Connect to a Sui Network](../build/connect-sui-network.md) | Updated the topic to include instructions for connecting to Sui Testnet. Topic title changed from "Connect to Sui Devnet". |
 | [Sui Full Node](../build/fullnode.md) | Updated to include instructions for using Sui Indexer. |
 | [Sui Object Display Standard](../build/sui-object-display.md) | New topic about using the Sui Object Display standard. |
 | [Sui Programmable Transaction Blocks](../build/prog-trans-ts-sdk.md) | New topic about how to use the new Programmable Transaction blocks. |
@@ -48,8 +54,6 @@ This topic lists the significant updates to the [Sui documentation](https://docs
 | Topic | Update | 
 | :------ | :------- |
 | [Sui Move by Example](../explore/move-examples/index.md) | [Relocated this content](https://github.com/MystenLabs/sui/pull/6957) from examples.sui.io to the Explore section of docs.sui.io. |
-| [Sui Framework Reference](../reference/framework/index.md) | [Added links to each module topic in the Framework Reference](https://github.com/MystenLabs/sui/pull/6958) folder in the repo until we can properly add them to the Docs site. |
-
 
 ## Week ending 12/17/22
 
@@ -57,7 +61,7 @@ This topic lists the significant updates to the [Sui documentation](https://docs
 | :------ | :------- |
 | [Explore Sui](../explore/index.md) | Added [Sui Capys](https://docs.sui.io/) and [Satoshi Flip](https://satoshi-flip.sui.io/) apps. |
 | [Event API](../build/event_api.md) | [Copyedit and reformat for readability](https://github.com/MystenLabs/sui/pull/6718). |
-| [Connect to Devnet](../build/devnet.md) | [Copyedit and updates for style consistency](https://github.com/MystenLabs/sui/pull/6715/files#diff-33791b72aa9e90e09f1b9f85972b29b605e388dff5130b2cdd9417a6946c8012).
+| [Connect to a Sui Network](../build/connect-sui-network.md) | [Copyedit and updates for style consistency](https://github.com/MystenLabs/sui/pull/6715/files#diff-33791b72aa9e90e09f1b9f85972b29b605e388dff5130b2cdd9417a6946c8012).
 | Multiple | Removed $ from example commands. Changed style for keyboard key names to use **bold** instead of `code` format. |
 
 
@@ -100,7 +104,6 @@ This topic lists the significant updates to the [Sui documentation](https://docs
 
 | Topic | Update | 
 | :------ | :------- |
-| [Install Sui](../build/install.md) | Removed the setup script (sui-setup.sh) until we can resolve the errors with the latest version of Sui. |
 | [Explore Sui](../explore/index.md) | General copyedits for style, removed some stale images and examples. |
 
 ## Week ending 10/01/22

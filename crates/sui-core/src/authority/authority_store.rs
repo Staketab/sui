@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::Ordering;
-use std::iter;
 use std::ops::Not;
 use std::path::Path;
 use std::sync::Arc;
+use std::{iter, mem, thread};
 
 use either::Either;
 use fastcrypto::hash::MultisetHash;
+use futures::stream::FuturesUnordered;
 use move_bytecode_utils::module_cache::GetModule;
 use move_core_types::resolver::ModuleResolver;
 use once_cell::sync::OnceCell;
@@ -43,6 +44,7 @@ use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfigura
 use super::authority_store_tables::LiveObject;
 use super::{authority_store_tables::AuthorityPerpetualTables, *};
 use mysten_common::sync::notify_read::NotifyRead;
+use sui_storage::package_object_cache::PackageObjectCache;
 use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
 use typed_store::rocks::util::is_ref_count_value;
 
@@ -109,6 +111,8 @@ pub struct AuthorityStore {
 
     // Implementation detail to support notify_read_effects().
     pub(crate) executed_effects_notify_read: NotifyRead<TransactionDigest, TransactionEffects>,
+    pub(crate) executed_effects_digests_notify_read:
+        NotifyRead<TransactionDigest, TransactionEffectsDigest>,
 
     pub(crate) root_state_notify_read: NotifyRead<EpochId, (CheckpointSequenceNumber, Accumulator)>,
     /// This lock denotes current 'execution epoch'.
@@ -142,7 +146,7 @@ impl AuthorityStore {
         indirect_objects_threshold: usize,
         enable_epoch_sui_conservation_check: bool,
         registry: &Registry,
-    ) -> SuiResult<Self> {
+    ) -> SuiResult<Arc<Self>> {
         let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(path, db_options.clone()));
         let epoch_start_configuration = if perpetual_tables.database_is_empty()? {
             let epoch_start_configuration = EpochStartConfiguration::new(
@@ -157,7 +161,7 @@ impl AuthorityStore {
             perpetual_tables
                 .epoch_start_configuration
                 .get(&())?
-                .expect("Epoch start configuration must be set in non-epmty DB")
+                .expect("Epoch start configuration must be set in non-empty DB")
         };
         let cur_epoch = perpetual_tables.get_recovery_epoch_at_restart()?;
         let committee = committee_store
@@ -197,7 +201,7 @@ impl AuthorityStore {
         committee: &Committee,
         genesis: &Genesis,
         indirect_objects_threshold: usize,
-    ) -> SuiResult<Self> {
+    ) -> SuiResult<Arc<Self>> {
         // TODO: Since we always start at genesis, the committee should be technically the same
         // as the genesis committee.
         assert_eq!(committee.epoch, 0);
@@ -220,13 +224,14 @@ impl AuthorityStore {
         indirect_objects_threshold: usize,
         enable_epoch_sui_conservation_check: bool,
         registry: &Registry,
-    ) -> SuiResult<Self> {
+    ) -> SuiResult<Arc<Self>> {
         let epoch = committee.epoch;
 
-        let store = Self {
+        let store = Arc::new(Self {
             mutex_table: MutexTable::new(NUM_SHARDS),
             perpetual_tables,
             executed_effects_notify_read: NotifyRead::new(),
+            executed_effects_digests_notify_read: NotifyRead::new(),
             root_state_notify_read:
                 NotifyRead::<EpochId, (CheckpointSequenceNumber, Accumulator)>::new(),
             execution_lock: RwLock::new(epoch),
@@ -234,7 +239,7 @@ impl AuthorityStore {
             indirect_objects_threshold,
             enable_epoch_sui_conservation_check,
             metrics: AuthorityStoreMetrics::new(registry),
-        };
+        });
         // Only initialize an empty database.
         if store
             .database_is_empty()
@@ -351,6 +356,15 @@ impl AuthorityStore {
             Some(digest) => Ok(self.perpetual_tables.effects.get(&digest)?),
             None => Ok(None),
         }
+    }
+
+    /// Given a list of transaction digests, returns a list of the corresponding effects only if they have been
+    /// executed. For transactions that have not been executed, None is returned.
+    pub fn multi_get_executed_effects_digests(
+        &self,
+        digests: &[TransactionDigest],
+    ) -> SuiResult<Vec<Option<TransactionEffectsDigest>>> {
+        Ok(self.perpetual_tables.executed_effects.multi_get(digests)?)
     }
 
     /// Given a list of transaction digests, returns a list of the corresponding effects only if they have been
@@ -490,12 +504,15 @@ impl AuthorityStore {
         &self,
         object_keys: &[ObjectKey],
     ) -> Result<Vec<Option<Object>>, SuiError> {
-        let wrappers = self.perpetual_tables.objects.multi_get(object_keys)?;
+        let wrappers = self
+            .perpetual_tables
+            .objects
+            .multi_get(object_keys.to_vec())?;
         let mut ret = vec![];
 
-        for w in wrappers {
+        for (idx, w) in wrappers.into_iter().enumerate() {
             ret.push(
-                w.map(|object| self.perpetual_tables.object(object))
+                w.map(|object| self.perpetual_tables.object(&object_keys[idx], object))
                     .transpose()?
                     .flatten(),
             );
@@ -871,6 +888,7 @@ impl AuthorityStore {
             deleted,
             events,
             max_binary_format_version: _,
+            loaded_child_objects: _,
         } = inner_temporary_store;
         trace!(written =? written.values().map(|((obj_id, ver, _), _, _)| (obj_id, ver)).collect::<Vec<_>>(),
                "batch_update_objects: temp store written");
@@ -1295,6 +1313,7 @@ impl AuthorityStore {
                         let obj = self
                             .perpetual_tables
                             .object(
+                                &key,
                                 obj_opt
                                     .expect(&format!("Older object version not found: {:?}", key)),
                             )
@@ -1448,7 +1467,7 @@ impl AuthorityStore {
         self.perpetual_tables.iter_live_object_set()
     }
 
-    pub fn expensive_check_sui_conservation(&self) -> SuiResult {
+    pub fn expensive_check_sui_conservation(self: &Arc<Self>) -> SuiResult {
         if !self.enable_epoch_sui_conservation_check {
             return Ok(());
         }
@@ -1462,22 +1481,51 @@ impl AuthorityStore {
             return Ok(());
         }
 
-        let mut total_storage_rebate = 0;
-        let mut total_sui = 0;
         info!("Starting SUI conservation check. This may take a while..");
         let cur_time = Instant::now();
+        let mut pending_objects = vec![];
         let mut count = 0;
-        for o in self.iter_live_object_set() {
-            match o {
-                LiveObject::Normal(object) => {
-                    total_storage_rebate += object.storage_rebate;
-                    // get_total_sui includes storage rebate, however all storage rebate is
-                    // also stored in the storage fund, so we need to subtract it here.
-                    total_sui += object.get_total_sui(self)? - object.storage_rebate;
-                    count += 1;
+        let package_cache = PackageObjectCache::new(self.clone());
+        let (mut total_sui, mut total_storage_rebate) = thread::scope(|s| {
+            let pending_tasks = FuturesUnordered::new();
+            for o in self.iter_live_object_set() {
+                match o {
+                    LiveObject::Normal(object) => {
+                        pending_objects.push(object);
+                        count += 1;
+                        if count % 1_000_000 == 0 {
+                            let mut task_objects = vec![];
+                            mem::swap(&mut pending_objects, &mut task_objects);
+                            let package_cache_clone = package_cache.clone();
+                            pending_tasks.push(s.spawn(move || {
+                                let mut total_storage_rebate = 0;
+                                let mut total_sui = 0;
+                                for object in task_objects {
+                                    total_storage_rebate += object.storage_rebate;
+                                    // get_total_sui includes storage rebate, however all storage rebate is
+                                    // also stored in the storage fund, so we need to subtract it here.
+                                    total_sui +=
+                                        object.get_total_sui(&package_cache_clone).unwrap()
+                                            - object.storage_rebate;
+                                }
+                                if count % 50_000_000 == 0 {
+                                    info!("Processed {} objects", count);
+                                }
+                                (total_sui, total_storage_rebate)
+                            }));
+                        }
+                    }
+                    LiveObject::Wrapped(_) => (),
                 }
-                LiveObject::Wrapped(_) => (),
             }
+            pending_tasks.into_iter().fold((0, 0), |init, result| {
+                let result = result.join().unwrap();
+                (init.0 + result.0, init.1 + result.1)
+            })
+        });
+        for object in pending_objects {
+            total_storage_rebate += object.storage_rebate;
+            total_sui += object.get_total_sui(self).unwrap() - object.storage_rebate;
         }
         info!(
             "Scanned {} live objects, took {:?}",
@@ -1620,13 +1668,7 @@ impl ObjectStore for AuthorityStore {
         object_id: &ObjectID,
         version: VersionNumber,
     ) -> Result<Option<Object>, SuiError> {
-        Ok(self
-            .perpetual_tables
-            .objects
-            .get(&ObjectKey(*object_id, version))?
-            .map(|object| self.perpetual_tables.object(object))
-            .transpose()?
-            .flatten())
+        self.perpetual_tables.get_object_by_key(object_id, version)
     }
 }
 

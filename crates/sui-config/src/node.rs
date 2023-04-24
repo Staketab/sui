@@ -3,6 +3,7 @@
 
 use crate::genesis;
 use crate::p2p::P2pConfig;
+use crate::transaction_deny_config::TransactionDenyConfig;
 use crate::Config;
 use anyhow::Result;
 use narwhal_config::Parameters as ConsensusParameters;
@@ -17,7 +18,7 @@ use std::usize;
 use sui_keys::keypair_file::{read_authority_keypair_from_file, read_keypair_from_file};
 use sui_protocol_config::SupportedProtocolVersions;
 use sui_storage::object_store::ObjectStoreConfig;
-use sui_types::base_types::SuiAddress;
+use sui_types::base_types::{ObjectID, SuiAddress};
 use sui_types::crypto::AuthorityPublicKeyBytes;
 use sui_types::crypto::KeypairTraits;
 use sui_types::crypto::NetworkKeyPair;
@@ -62,8 +63,12 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consensus_config: Option<ConsensusConfig>,
 
+    // TODO: Remove this as it's no longer used.
     #[serde(default)]
     pub enable_event_processing: bool,
+
+    #[serde(default = "default_enable_index_processing")]
+    pub enable_index_processing: bool,
 
     #[serde(default)]
     pub grpc_load_shed: Option<bool>,
@@ -105,10 +110,20 @@ pub struct NodeConfig {
 
     #[serde(default)]
     pub expensive_safety_check_config: ExpensiveSafetyCheckConfig,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_service_resolver_object_id: Option<ObjectID>,
+
+    #[serde(default)]
+    pub transaction_deny_config: TransactionDenyConfig,
 }
 
 fn default_authority_store_pruning_config() -> AuthorityStorePruningConfig {
     AuthorityStorePruningConfig::default()
+}
+
+pub fn default_enable_index_processing() -> bool {
+    true
 }
 
 fn default_grpc_address() -> Multiaddr {
@@ -277,6 +292,7 @@ pub struct ExpensiveSafetyCheckConfig {
     /// If enabled, we will check that the total SUI in all input objects of a tx
     /// (both the Move part and the storage rebate) matches the total SUI in all
     /// output objects of the tx + gas fees
+    #[serde(default)]
     enable_deep_per_tx_sui_conservation_check: bool,
 
     /// Disable epoch SUI conservation check even when we are running in debug mode.
@@ -390,7 +406,7 @@ impl Default for AuthorityStorePruningConfig {
             epoch_db_pruning_period_secs: u64::MAX,
             num_epochs_to_retain: 2,
             pruning_run_delay_seconds: None,
-            max_checkpoints_in_batch: 200,
+            max_checkpoints_in_batch: 10,
             max_transactions_in_batch: 1000,
             use_range_deletion: true,
         }
@@ -404,7 +420,7 @@ impl AuthorityStorePruningConfig {
             epoch_db_pruning_period_secs: 60 * 60,
             num_epochs_to_retain: 2,
             pruning_run_delay_seconds: None,
-            max_checkpoints_in_batch: 200,
+            max_checkpoints_in_batch: 10,
             max_transactions_in_batch: 1000,
             use_range_deletion: true,
         }
@@ -415,7 +431,7 @@ impl AuthorityStorePruningConfig {
             epoch_db_pruning_period_secs: 60 * 60,
             num_epochs_to_retain: 2,
             pruning_run_delay_seconds: None,
-            max_checkpoints_in_batch: 200,
+            max_checkpoints_in_batch: 10,
             max_transactions_in_batch: 1000,
             use_range_deletion: true,
         }
@@ -440,6 +456,8 @@ pub struct DBCheckpointConfig {
     pub checkpoint_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_store_config: Option<ObjectStoreConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perform_index_db_checkpoints_at_epoch_end: Option<bool>,
 }
 
 /// Publicly known information about a validator

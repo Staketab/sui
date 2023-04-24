@@ -33,6 +33,7 @@ use crate::parse_sui_struct_tag;
 use crate::signature::GenericSignature;
 use crate::sui_serde::HexAccountAddress;
 use crate::sui_serde::Readable;
+use crate::MOVE_STDLIB_ADDRESS;
 use crate::SUI_FRAMEWORK_ADDRESS;
 use crate::SUI_SYSTEM_ADDRESS;
 use anyhow::anyhow;
@@ -40,6 +41,9 @@ use fastcrypto::encoding::decode_bytes_hex;
 use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::hash::HashFunction;
 use fastcrypto::traits::AllowedRng;
+use move_binary_format::binary_views::BinaryIndexedView;
+use move_binary_format::file_format::SignatureToken;
+use move_bytecode_utils::resolve_struct;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::ident_str;
 use move_core_types::identifier::IdentStr;
@@ -74,6 +78,7 @@ mod base_types_tests;
     Deserialize,
     JsonSchema,
 )]
+#[cfg_attr(feature = "fuzzing", derive(proptest_derive::Arbitrary))]
 pub struct SequenceNumber(u64);
 
 impl SequenceNumber {
@@ -191,6 +196,15 @@ impl MoveObjectType {
             MoveObjectType_::StakedSui => vec![],
             MoveObjectType_::Coin(inner) => vec![inner],
             MoveObjectType_::Other(s) => s.type_params,
+        }
+    }
+
+    pub fn coin_type_maybe(&self) -> Option<TypeTag> {
+        match &self.0 {
+            MoveObjectType_::GasCoin => Some(GAS::type_tag()),
+            MoveObjectType_::Coin(inner) => Some(inner.clone()),
+            MoveObjectType_::StakedSui => None,
+            MoveObjectType_::Other(_) => None,
         }
     }
 
@@ -386,25 +400,20 @@ impl ObjectInfo {
 const PACKAGE: &str = "package";
 impl ObjectType {
     pub fn is_gas_coin(&self) -> bool {
-        match self {
-            ObjectType::Struct(s) => s.is_gas_coin(),
-            ObjectType::Package => false,
-        }
+        matches!(self, ObjectType::Struct(s) if s.is_gas_coin())
     }
 
     pub fn is_coin(&self) -> bool {
-        match self {
-            ObjectType::Struct(s) => s.is_coin(),
-            ObjectType::Package => false,
-        }
+        matches!(self, ObjectType::Struct(s) if s.is_coin())
     }
 
     /// Return true if `self` is `0x2::coin::Coin<t>`
     pub fn is_coin_t(&self, t: &TypeTag) -> bool {
-        match self {
-            ObjectType::Struct(s) => s.is_coin_t(t),
-            ObjectType::Package => false,
-        }
+        matches!(self, ObjectType::Struct(s) if s.is_coin_t(t))
+    }
+
+    pub fn is_package(&self) -> bool {
+        matches!(self, ObjectType::Package)
     }
 }
 
@@ -426,6 +435,7 @@ pub const SUI_ADDRESS_LENGTH: usize = ObjectID::LENGTH;
 #[derive(
     Eq, Default, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Serialize, Deserialize, JsonSchema,
 )]
+#[cfg_attr(feature = "fuzzing", derive(proptest_derive::Arbitrary))]
 pub struct SuiAddress(
     #[schemars(with = "Hex")]
     #[serde_as(as = "Readable<Hex, _>")]
@@ -683,12 +693,27 @@ impl VerifiedExecutionData {
 
 pub const STD_OPTION_MODULE_NAME: &IdentStr = ident_str!("option");
 pub const STD_OPTION_STRUCT_NAME: &IdentStr = ident_str!("Option");
+pub const RESOLVED_STD_OPTION: (&AccountAddress, &IdentStr, &IdentStr) = (
+    &MOVE_STDLIB_ADDRESS,
+    STD_OPTION_MODULE_NAME,
+    STD_OPTION_STRUCT_NAME,
+);
 
 pub const STD_ASCII_MODULE_NAME: &IdentStr = ident_str!("ascii");
 pub const STD_ASCII_STRUCT_NAME: &IdentStr = ident_str!("String");
+pub const RESOLVED_ASCII_STR: (&AccountAddress, &IdentStr, &IdentStr) = (
+    &MOVE_STDLIB_ADDRESS,
+    STD_ASCII_MODULE_NAME,
+    STD_ASCII_STRUCT_NAME,
+);
 
 pub const STD_UTF8_MODULE_NAME: &IdentStr = ident_str!("string");
 pub const STD_UTF8_STRUCT_NAME: &IdentStr = ident_str!("String");
+pub const RESOLVED_UTF8_STR: (&AccountAddress, &IdentStr, &IdentStr) = (
+    &MOVE_STDLIB_ADDRESS,
+    STD_UTF8_MODULE_NAME,
+    STD_UTF8_STRUCT_NAME,
+);
 
 pub const TX_CONTEXT_MODULE_NAME: &IdentStr = ident_str!("tx_context");
 pub const TX_CONTEXT_STRUCT_NAME: &IdentStr = ident_str!("TxContext");
@@ -707,14 +732,63 @@ pub struct TxContext {
     ids_created: u64,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum TxContextKind {
+    // No TxContext
+    None,
+    // &mut TxContext
+    Mutable,
+    // &TxContext
+    Immutable,
+}
+
 impl TxContext {
     pub fn new(sender: &SuiAddress, digest: &TransactionDigest, epoch_data: &EpochData) -> Self {
+        Self::new_from_components(
+            sender,
+            digest,
+            &epoch_data.epoch_id(),
+            epoch_data.epoch_start_timestamp(),
+        )
+    }
+
+    pub fn new_from_components(
+        sender: &SuiAddress,
+        digest: &TransactionDigest,
+        epoch_id: &EpochId,
+        epoch_timestamp_ms: u64,
+    ) -> Self {
         Self {
             sender: AccountAddress::new(sender.0),
             digest: digest.into_inner().to_vec(),
-            epoch: epoch_data.epoch_id(),
-            epoch_timestamp_ms: epoch_data.epoch_start_timestamp(),
+            epoch: *epoch_id,
+            epoch_timestamp_ms,
             ids_created: 0,
+        }
+    }
+
+    /// Returns whether the type signature is &mut TxContext, &TxContext, or none of the above.
+    pub fn kind(view: &BinaryIndexedView<'_>, s: &SignatureToken) -> TxContextKind {
+        use SignatureToken as S;
+        let (kind, s) = match s {
+            S::MutableReference(s) => (TxContextKind::Mutable, s),
+            S::Reference(s) => (TxContextKind::Immutable, s),
+            _ => return TxContextKind::None,
+        };
+
+        let S::Struct(idx) = &**s else {
+            return TxContextKind::None;
+        };
+
+        let (module_addr, module_name, struct_name) = resolve_struct(view, *idx);
+        let is_tx_context_type = module_name == TX_CONTEXT_MODULE_NAME
+            && module_addr == &SUI_FRAMEWORK_ADDRESS
+            && struct_name == TX_CONTEXT_STRUCT_NAME;
+
+        if is_tx_context_type {
+            kind
+        } else {
+            TxContextKind::None
         }
     }
 
