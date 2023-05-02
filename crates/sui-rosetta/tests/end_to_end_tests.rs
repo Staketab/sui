@@ -15,7 +15,7 @@ use sui_rosetta::types::{
     SubAccount, SubAccountType, SuiEnv,
 };
 use sui_sdk::rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI};
-use sui_types::messages::ExecuteTransactionRequestType;
+use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::utils::to_sender_signed_transaction;
 use test_utils::network::TestClusterBuilder;
 
@@ -103,7 +103,7 @@ async fn test_get_staked_sui() {
         .unwrap();
     let tx = to_sender_signed_transaction(delegation_tx, keystore.get_key(&address).unwrap());
     client
-        .quorum_driver()
+        .quorum_driver_api()
         .execute_transaction_block(
             tx,
             SuiTransactionBlockResponseOptions::new(),

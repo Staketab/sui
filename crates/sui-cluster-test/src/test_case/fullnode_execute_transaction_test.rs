@@ -7,7 +7,9 @@ use sui_json_rpc_types::{
     SuiExecutionStatus, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponseOptions,
 };
 use sui_sdk::SuiClient;
-use sui_types::{base_types::TransactionDigest, messages::ExecuteTransactionRequestType};
+use sui_types::{
+    base_types::TransactionDigest, quorum_driver_types::ExecuteTransactionRequestType,
+};
 use tracing::info;
 
 pub struct FullNodeExecuteTransactionTest;
@@ -56,7 +58,7 @@ impl TestCaseImpl for FullNodeExecuteTransactionTest {
         let txn_digest = *txn.digest();
 
         let response = fullnode
-            .quorum_driver()
+            .quorum_driver_api()
             .execute_transaction_block(
                 txn,
                 SuiTransactionBlockResponseOptions::new().with_effects(),
@@ -83,7 +85,7 @@ impl TestCaseImpl for FullNodeExecuteTransactionTest {
         let txn_digest = *txn.digest();
 
         let response = fullnode
-            .quorum_driver()
+            .quorum_driver_api()
             .execute_transaction_block(
                 txn,
                 SuiTransactionBlockResponseOptions::new().with_effects(),

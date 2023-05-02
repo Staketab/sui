@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-    useGetRollingAverageApys,
+    useGetValidatorsApy,
     useGetValidatorsEvents,
     useGetSystemState,
 } from '@mysten/core';
@@ -42,7 +42,7 @@ function ValidatorDetails() {
 
     const numberOfValidators = data?.activeValidators.length ?? null;
     const { data: rollingAverageApys, isLoading: validatorsApysLoading } =
-        useGetRollingAverageApys(numberOfValidators);
+        useGetValidatorsApy();
 
     const { data: validatorEvents, isLoading: validatorsEventsLoading } =
         useGetValidatorsEvents({
@@ -56,7 +56,8 @@ function ValidatorDetails() {
             validatorEvents,
             id
         )?.pool_staking_reward;
-        return Number(rewards) || 0;
+
+        return rewards ? Number(rewards) : null;
     }, [id, validatorEvents]);
 
     if (isLoading || validatorsEventsLoading || validatorsApysLoading) {

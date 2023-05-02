@@ -71,8 +71,9 @@ mod sim_only_tests {
     use sui_move_build::{BuildConfig, CompiledPackage};
     use sui_protocol_config::SupportedProtocolVersions;
     use sui_types::base_types::ObjectID;
+    use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
     use sui_types::id::ID;
-    use sui_types::messages::{Command, ProgrammableMoveCall, TransactionEffects};
+    use sui_types::messages::{Command, ProgrammableMoveCall};
     use sui_types::object::Owner;
     use sui_types::sui_system_state::{
         epoch_start_sui_system_state::EpochStartSystemStateTrait, get_validator_from_table,
@@ -80,13 +81,9 @@ mod sim_only_tests {
         SUI_SYSTEM_STATE_SIM_TEST_SHALLOW_V2, SUI_SYSTEM_STATE_SIM_TEST_V1,
     };
     use sui_types::{
-        base_types::SequenceNumber,
-        digests::TransactionDigest,
-        messages::{TransactionEffectsAPI, TransactionKind},
-        object::Object,
-        programmable_transaction_builder::ProgrammableTransactionBuilder,
-        storage::ObjectStore,
-        MOVE_STDLIB_OBJECT_ID, SUI_FRAMEWORK_OBJECT_ID, SUI_SYSTEM_OBJECT_ID,
+        base_types::SequenceNumber, digests::TransactionDigest, messages::TransactionKind,
+        object::Object, programmable_transaction_builder::ProgrammableTransactionBuilder,
+        storage::ObjectStore, MOVE_STDLIB_OBJECT_ID, SUI_FRAMEWORK_OBJECT_ID, SUI_SYSTEM_OBJECT_ID,
     };
     use test_utils::network::{TestCluster, TestClusterBuilder};
     use tokio::time::{sleep, Duration};
@@ -304,7 +301,6 @@ mod sim_only_tests {
     async fn test_framework_compatible_upgrade() {
         // Make a number of compatible changes, and expect the upgrade to go through:
         // - Add a new module, struct, and function
-        // - Add a new ability to an existing struct
         // - Remove an ability from an existing type constraint
         // - Change the implementation of an existing function
         // - Change the signature and implementation of a private function
@@ -325,6 +321,15 @@ mod sim_only_tests {
     async fn test_framework_incompatible_struct_layout() {
         // Upgrade attempts to change an existing struct layout
         let cluster = run_framework_upgrade("base", "change_struct_layout").await;
+        assert_eq!(call_canary(&cluster).await, 42);
+        expect_upgrade_failed(&cluster).await;
+        assert_eq!(call_canary(&cluster).await, 42);
+    }
+
+    #[sim_test]
+    async fn test_framework_add_struct_ability() {
+        // Upgrade attempts to add an ability to a struct
+        let cluster = run_framework_upgrade("base", "add_struct_ability").await;
         assert_eq!(call_canary(&cluster).await, 42);
         expect_upgrade_failed(&cluster).await;
         assert_eq!(call_canary(&cluster).await, 42);

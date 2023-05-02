@@ -152,6 +152,8 @@ pub enum ToolCommand {
         rpc_url: String,
         #[clap(long = "safety-checks")]
         safety_checks: bool,
+        #[clap(long = "authority")]
+        use_authority: bool,
         #[clap(subcommand)]
         cmd: ReplayToolCommand,
     },
@@ -317,7 +319,10 @@ impl ToolCommand {
                 rpc_url,
                 safety_checks,
                 cmd,
-            } => execute_replay_command(rpc_url, safety_checks, cmd).await?,
+                use_authority,
+            } => {
+                execute_replay_command(rpc_url, safety_checks, use_authority, cmd).await?;
+            }
         };
         Ok(())
     }

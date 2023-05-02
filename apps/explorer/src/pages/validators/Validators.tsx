@@ -3,7 +3,7 @@
 
 import {
     roundFloat,
-    useGetRollingAverageApys,
+    useGetValidatorsApy,
     type ApyByValidator,
     useGetValidatorsEvents,
     formatPercentageDisplay,
@@ -54,6 +54,7 @@ export function validatorsTableData(
                     ([address]) => address === validator.suiAddress
                 );
                 const isAtRisk = !!atRiskValidator;
+                const lastReward = event?.pool_staking_reward ?? null;
 
                 return {
                     name: {
@@ -67,7 +68,8 @@ export function validatorsTableData(
                     commission: Number(validator.commissionRate) / 100,
                     img: img,
                     address: validator.suiAddress,
-                    lastReward: Number(event?.pool_staking_reward) || 0,
+                    lastReward: lastReward ? Number(lastReward) : null,
+                    votingPower: Number(validator.votingPower) / 100,
                     atRisk: isAtRisk
                         ? VALIDATOR_LOW_STAKE_GRACE_PERIOD -
                           Number(atRiskValidator[1])
@@ -167,11 +169,23 @@ export function validatorsTableData(
                 accessorKey: 'lastReward',
                 cell: (props: any) => {
                     const lastReward = props.getValue();
-                    return lastReward > 0 ? (
+                    return lastReward >= 0 ? (
                         <StakeColumn stake={lastReward} />
                     ) : (
                         <Text variant="bodySmall/medium" color="steel-darker">
                             --
+                        </Text>
+                    );
+                },
+            },
+            {
+                header: 'Voting Power',
+                accessorKey: 'votingPower',
+                cell: (props: any) => {
+                    const votingPower = props.getValue();
+                    return (
+                        <Text variant="bodySmall/medium" color="steel-darker">
+                            {votingPower}%
                         </Text>
                     );
                 },
@@ -224,8 +238,7 @@ function ValidatorPageResult() {
         order: 'descending',
     });
 
-    const { data: rollingAverageApys } =
-        useGetRollingAverageApys(numberOfValidators);
+    const { data: validatorsApy } = useGetValidatorsApy();
 
     const totalStaked = useMemo(() => {
         if (!data) return 0;
@@ -238,21 +251,18 @@ function ValidatorPageResult() {
     }, [data]);
 
     const averageAPY = useMemo(() => {
-        if (
-            !rollingAverageApys ||
-            Object.keys(rollingAverageApys)?.length === 0
-        )
+        if (!validatorsApy || Object.keys(validatorsApy)?.length === 0)
             return null;
 
         // exclude validators with no apy
-        const apys = Object.values(rollingAverageApys)?.filter((a) => a > 0);
+        const apys = Object.values(validatorsApy)?.filter((a) => a > 0);
         const averageAPY = apys?.reduce((acc, cur) => acc + cur, 0);
         // in case of no apy, return 0
         return apys.length > 0 ? roundFloat(averageAPY / apys.length) : 0;
-    }, [rollingAverageApys]);
+    }, [validatorsApy]);
 
     const lastEpochRewardOnAllValidators = useMemo(() => {
-        if (!validatorEvents) return 0;
+        if (!validatorEvents) return null;
         let totalRewards = 0;
 
         validatorEvents.forEach(({ parsedJson }) => {
@@ -268,9 +278,9 @@ function ValidatorPageResult() {
             data.activeValidators,
             data.atRiskValidators,
             validatorEvents,
-            rollingAverageApys
+            validatorsApy || null
         );
-    }, [data, validatorEvents, rollingAverageApys]);
+    }, [data, validatorEvents, validatorsApy]);
 
     if (isError || validatorEventError) {
         return (
@@ -305,12 +315,15 @@ function ValidatorPageResult() {
                                     label="Last Epoch Rewards"
                                     tooltip="The stake rewards collected during the last epoch."
                                     unavailable={
-                                        lastEpochRewardOnAllValidators <= 0
+                                        lastEpochRewardOnAllValidators === null
                                     }
                                 >
                                     <DelegationAmount
                                         amount={
-                                            lastEpochRewardOnAllValidators || 0n
+                                            typeof lastEpochRewardOnAllValidators ===
+                                            'number'
+                                                ? lastEpochRewardOnAllValidators
+                                                : 0n
                                         }
                                         isStats
                                     />

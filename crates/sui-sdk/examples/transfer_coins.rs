@@ -11,7 +11,7 @@ use sui_sdk::{
     },
     SuiClientBuilder,
 };
-use sui_types::messages::ExecuteTransactionRequestType;
+use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -40,7 +40,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Execute the transaction
     let transaction_response = sui
-        .quorum_driver()
+        .quorum_driver_api()
         .execute_transaction_block(
             Transaction::from_data(transfer_tx, Intent::sui_transaction(), vec![signature])
                 .verify()?,

@@ -13,7 +13,7 @@ use crate::quorum_driver::reconfig_observer::{OnsiteReconfigObserver, ReconfigOb
 use crate::quorum_driver::{QuorumDriverHandler, QuorumDriverHandlerBuilder, QuorumDriverMetrics};
 use crate::safe_client::SafeClientMetricsBase;
 use mysten_common::sync::notify_read::{NotifyRead, Registration};
-use mysten_metrics::histogram::{Histogram, HistogramTimerGuard, HistogramVec};
+use mysten_metrics::histogram::{Histogram, HistogramVec};
 use mysten_metrics::spawn_monitored_task;
 use prometheus::core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge};
 use prometheus::{
@@ -25,14 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use sui_storage::write_path_pending_tx_log::WritePathPendingTransactionLog;
 use sui_types::base_types::TransactionDigest;
+use sui_types::effects::{TransactionEffectsAPI, VerifiedCertifiedTransactionEffects};
 use sui_types::error::{SuiError, SuiResult};
-use sui_types::messages::{
-    ExecuteTransactionRequest, ExecuteTransactionRequestType, ExecuteTransactionResponse,
-    FinalizedEffects, QuorumDriverResponse, TransactionEffectsAPI,
-    VerifiedCertifiedTransactionEffects, VerifiedExecutableTransaction,
-};
+use sui_types::executable_transaction::VerifiedExecutableTransaction;
+use sui_types::object::Object;
 use sui_types::quorum_driver_types::{
-    QuorumDriverEffectsQueueResult, QuorumDriverError, QuorumDriverResult,
+    ExecuteTransactionRequest, ExecuteTransactionRequestType, ExecuteTransactionResponse,
+    FinalizedEffects, QuorumDriverEffectsQueueResult, QuorumDriverError, QuorumDriverResponse,
+    QuorumDriverResult,
 };
 use sui_types::sui_system_state::SuiSystemState;
 use tokio::sync::broadcast::error::RecvError;
@@ -49,7 +49,7 @@ const LOCAL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 const WAIT_FOR_FINALITY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct TransactiondOrchestrator<A> {
+pub struct TransactiondOrchestrator<A: Clone> {
     quorum_driver_handler: Arc<QuorumDriverHandler<A>>,
     validator_state: Arc<AuthorityState>,
     _local_executor_handle: JoinHandle<()>,
@@ -145,26 +145,6 @@ where
         }
     }
 
-    fn get_timer_guards(&self, tx: &VerifiedTransaction) -> Vec<HistogramTimerGuard> {
-        let mut guards = vec![];
-        if tx.contains_shared_object() {
-            guards.push(self.metrics.request_latency_shared_obj.start_timer());
-            guards.push(
-                self.metrics
-                    .wait_for_finality_latency_shared_obj
-                    .start_timer(),
-            );
-        } else {
-            guards.push(self.metrics.request_latency_single_writer.start_timer());
-            guards.push(
-                self.metrics
-                    .wait_for_finality_latency_single_writer
-                    .start_timer(),
-            );
-        }
-        guards
-    }
-
     #[instrument(name = "tx_orchestrator_execute_transaction", level = "debug", skip_all,
     fields(
         tx_digest = ?request.transaction.digest(),
@@ -187,8 +167,21 @@ where
         let tx_digest = *transaction.digest();
         debug!(?tx_digest, "TO Received transaction execution request.");
 
-        let _timer_guards = self.get_timer_guards(&transaction);
-
+        let (_e2e_latency_timer, _txn_finality_timer) = if transaction.contains_shared_object() {
+            (
+                self.metrics.request_latency_shared_obj.start_timer(),
+                self.metrics
+                    .wait_for_finality_latency_shared_obj
+                    .start_timer(),
+            )
+        } else {
+            (
+                self.metrics.request_latency_single_writer.start_timer(),
+                self.metrics
+                    .wait_for_finality_latency_single_writer
+                    .start_timer(),
+            )
+        };
         let ticket = self.submit(transaction.clone()).await.map_err(|e| {
             warn!(?tx_digest, "QuorumDriverInternalError: {e:?}");
             QuorumDriverError::QuorumDriverInternalError(e)
@@ -206,11 +199,16 @@ where
             debug!(?tx_digest, "Timeout waiting for transaction finality.");
             return Err(QuorumDriverError::TimeoutBeforeFinality);
         };
+        drop(_txn_finality_timer);
         match result {
             Err(err) => Err(err),
             Ok(response) => {
                 good_response_metrics.inc();
-                let QuorumDriverResponse { effects_cert, .. } = response;
+                let QuorumDriverResponse {
+                    effects_cert,
+                    objects,
+                    ..
+                } = response;
                 if !wait_for_local_execution {
                     return Ok(ExecuteTransactionResponse::EffectsCert(Box::new((
                         FinalizedEffects::new_from_effects_cert(effects_cert.into()),
@@ -227,6 +225,7 @@ where
                     &self.validator_state,
                     &executable_tx,
                     &effects_cert,
+                    &objects,
                     &self.metrics,
                 )
                 .await
@@ -271,6 +270,7 @@ where
         validator_state: &Arc<AuthorityState>,
         transaction: &VerifiedExecutableTransaction,
         effects_cert: &VerifiedCertifiedTransactionEffects,
+        objects: &Vec<Object>,
         metrics: &TransactionOrchestratorMetrics,
     ) -> SuiResult {
         let epoch_store = validator_state.load_epoch_store_one_call_per_task();
@@ -303,6 +303,7 @@ where
             validator_state.fullnode_execute_certificate_with_effects(
                 transaction,
                 effects_cert,
+                objects,
                 &epoch_store,
             ),
         )
@@ -343,7 +344,14 @@ where
     ) {
         loop {
             match effects_receiver.recv().await {
-                Ok(Ok((transaction, QuorumDriverResponse { effects_cert, .. }))) => {
+                Ok(Ok((
+                    transaction,
+                    QuorumDriverResponse {
+                        effects_cert,
+                        objects,
+                        ..
+                    },
+                ))) => {
                     let executable_tx = VerifiedExecutableTransaction::new_from_quorum_execution(
                         transaction,
                         effects_cert.executed_epoch(),
@@ -359,6 +367,7 @@ where
                         &validator_state,
                         &executable_tx,
                         &effects_cert,
+                        &objects,
                         &metrics,
                     )
                     .await;

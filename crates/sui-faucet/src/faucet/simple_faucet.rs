@@ -13,17 +13,18 @@ use std::collections::HashSet;
 use std::path::Path;
 use typed_store::Map;
 
-use sui::client_commands::WalletContext;
 use sui_json_rpc_types::{
     SuiObjectDataOptions, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse,
     SuiTransactionBlockResponseOptions,
 };
 use sui_keys::keystore::AccountKeystore;
+use sui_sdk::wallet_context::WalletContext;
 use sui_types::object::Owner;
+use sui_types::quorum_driver_types::ExecuteTransactionRequestType;
 use sui_types::{
     base_types::{ObjectID, SuiAddress, TransactionDigest},
     gas_coin::GasCoin,
-    messages::{ExecuteTransactionRequestType, Transaction, TransactionData, VerifiedTransaction},
+    messages::{Transaction, TransactionData, VerifiedTransaction},
 };
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
@@ -435,7 +436,7 @@ impl SimpleFaucet {
         let tx_digest = tx.digest();
         let client = self.wallet.get_client().await?;
         Ok(client
-            .quorum_driver()
+            .quorum_driver_api()
             .execute_transaction_block(
                 tx.clone(),
                 SuiTransactionBlockResponseOptions::new().with_effects(),
@@ -597,6 +598,7 @@ impl Faucet for SimpleFaucet {
 mod tests {
     use sui::client_commands::{SuiClientCommandResult, SuiClientCommands};
     use sui_json_rpc_types::SuiExecutionStatus;
+    use sui_sdk::wallet_context::WalletContext;
     use test_utils::network::TestClusterBuilder;
 
     use super::*;

@@ -13,6 +13,7 @@ use fastcrypto::traits::KeyPair;
 use prometheus::Registry;
 use std::path::PathBuf;
 use std::sync::Arc;
+use sui_config::certificate_deny_config::CertificateDenyConfig;
 use sui_config::genesis::Genesis;
 use sui_config::node::{
     AuthorityStorePruningConfig, DBCheckpointConfig, ExpensiveSafetyCheckConfig,
@@ -20,19 +21,27 @@ use sui_config::node::{
 use sui_config::transaction_deny_config::TransactionDenyConfig;
 use sui_config::NetworkConfig;
 use sui_macros::nondeterministic;
-use sui_protocol_config::SupportedProtocolVersions;
+use sui_protocol_config::{ProtocolConfig, SupportedProtocolVersions};
 use sui_storage::IndexStore;
 use sui_types::base_types::{AuthorityName, ObjectID};
 use sui_types::crypto::AuthorityKeyPair;
-use sui_types::messages::{VerifiedExecutableTransaction, VerifiedTransaction};
+use sui_types::error::SuiResult;
+use sui_types::executable_transaction::VerifiedExecutableTransaction;
+use sui_types::messages::VerifiedTransaction;
+use sui_types::object::Object;
+use sui_types::sui_system_state::SuiSystemStateTrait;
 
 #[derive(Default)]
 pub struct TestAuthorityBuilder<'a> {
     store_base_path: Option<PathBuf>,
     store: Option<Arc<AuthorityStore>>,
     transaction_deny_config: Option<TransactionDenyConfig>,
+    certificate_deny_config: Option<CertificateDenyConfig>,
+    protocol_config: Option<ProtocolConfig>,
+    reference_gas_price: Option<u64>,
     node_keypair: Option<&'a AuthorityKeyPair>,
     genesis: Option<&'a Genesis>,
+    starting_objects: Option<&'a [Object]>,
 }
 
 impl<'a> TestAuthorityBuilder<'a> {
@@ -42,6 +51,11 @@ impl<'a> TestAuthorityBuilder<'a> {
 
     pub fn with_store_base_path(mut self, path: PathBuf) -> Self {
         assert!(self.store_base_path.replace(path).is_none());
+        self
+    }
+
+    pub fn with_starting_objects(mut self, objects: &'a [Object]) -> Self {
+        assert!(self.starting_objects.replace(objects).is_none());
         self
     }
 
@@ -55,12 +69,37 @@ impl<'a> TestAuthorityBuilder<'a> {
         self
     }
 
+    pub fn with_certificate_deny_config(mut self, config: CertificateDenyConfig) -> Self {
+        assert!(self.certificate_deny_config.replace(config).is_none());
+        self
+    }
+
+    pub fn with_protocol_config(mut self, config: ProtocolConfig) -> Self {
+        assert!(self.protocol_config.replace(config).is_none());
+        self
+    }
+
+    pub fn with_reference_gas_price(mut self, reference_gas_price: u64) -> Self {
+        // If genesis is already set then setting rgp is meaningless since it will be overwritten.
+        assert!(self.genesis.is_none());
+        assert!(self
+            .reference_gas_price
+            .replace(reference_gas_price)
+            .is_none());
+        self
+    }
+
     pub fn with_genesis_and_keypair(
         mut self,
         genesis: &'a Genesis,
         keypair: &'a AuthorityKeyPair,
     ) -> Self {
         assert!(self.genesis.replace(genesis).is_none());
+        assert!(self.node_keypair.replace(keypair).is_none());
+        self
+    }
+
+    pub fn with_keypair(mut self, keypair: &'a AuthorityKeyPair) -> Self {
         assert!(self.node_keypair.replace(keypair).is_none());
         self
     }
@@ -74,8 +113,21 @@ impl<'a> TestAuthorityBuilder<'a> {
         )
     }
 
+    pub async fn side_load_objects(
+        authority_state: Arc<AuthorityState>,
+        objects: &'a [Object],
+    ) -> SuiResult {
+        authority_state
+            .database
+            .insert_raw_object_unchecked_for_testing(objects)
+            .await
+    }
+
     pub async fn build(self) -> Arc<AuthorityState> {
-        let local_network_config = sui_config::builder::ConfigBuilder::new_with_temp_dir().build();
+        let local_network_config = sui_config::builder::ConfigBuilder::new_with_temp_dir()
+            // TODO: change the default to 1000 instead after fixing tests.
+            .with_reference_gas_price(self.reference_gas_price.unwrap_or(1))
+            .build();
         let genesis = &self.genesis.unwrap_or(&local_network_config.genesis);
         let genesis_committee = genesis.committee().unwrap();
         let path = self.store_base_path.unwrap_or_else(|| {
@@ -108,13 +160,21 @@ impl<'a> TestAuthorityBuilder<'a> {
         let registry = Registry::new();
         let cache_metrics = Arc::new(ResolverMetrics::new(&registry));
         let signature_verifier_metrics = SignatureVerifierMetrics::new(&registry);
+        if self.protocol_config.is_some() {
+            let config = self.protocol_config.unwrap();
+            let _guard = ProtocolConfig::apply_overrides_for_testing(move |_, _| config.clone());
+        }
+        let epoch_start_configuration = EpochStartConfiguration::new(
+            genesis.sui_system_object().into_epoch_start_state(),
+            *genesis.checkpoint().digest(),
+        );
         let epoch_store = AuthorityPerEpochStore::new(
             name,
             Arc::new(genesis_committee.clone()),
             &path.join("store"),
             None,
             EpochMetrics::new(&registry),
-            EpochStartConfiguration::new_for_testing(),
+            epoch_start_configuration,
             authority_store.clone(),
             cache_metrics,
             signature_verifier_metrics,
@@ -128,8 +188,15 @@ impl<'a> TestAuthorityBuilder<'a> {
         ));
 
         let checkpoint_store = CheckpointStore::new(&path.join("checkpoints"));
-        let index_store = Some(Arc::new(IndexStore::new(path.join("indexes"), &registry)));
+        let index_store = Some(Arc::new(IndexStore::new(
+            path.join("indexes"),
+            &registry,
+            epoch_store
+                .protocol_config()
+                .max_move_identifier_len_as_option(),
+        )));
         let transaction_deny_config = self.transaction_deny_config.unwrap_or_default();
+        let certificate_deny_config = self.certificate_deny_config.unwrap_or_default();
         let state = AuthorityState::new(
             name,
             secret,
@@ -145,6 +212,8 @@ impl<'a> TestAuthorityBuilder<'a> {
             &DBCheckpointConfig::default(),
             ExpensiveSafetyCheckConfig::new_enable_all(),
             transaction_deny_config,
+            certificate_deny_config,
+            usize::MAX,
         )
         .await;
         // For any type of local testing that does not actually spawn a node, the checkpoint executor
@@ -163,6 +232,14 @@ impl<'a> TestAuthorityBuilder<'a> {
             )
             .await
             .unwrap();
+
+        if let Some(starting_objects) = self.starting_objects {
+            state
+                .database
+                .insert_raw_object_unchecked_for_testing(starting_objects)
+                .await
+                .unwrap();
+        };
         state
     }
 }
